@@ -1,0 +1,23 @@
+# Forge routing. Values come from deploy/.env:
+#   FORGE_DOMAIN    e.g. forge.example.com
+#   PREVIEW_DOMAIN  e.g. preview.forge.example.com  (project previews: <id>.PREVIEW_DOMAIN)
+#   TLS_MODE        letsencrypt-azure | company-ca | internal  (see ./tls/)
+
+{$FORGE_DOMAIN} {
+	import /etc/caddy/tls/{$TLS_MODE}.caddy
+	encode zstd gzip
+
+	# Live event stream goes straight to the orchestrator.
+	@ws path /api/ws
+	reverse_proxy @ws 127.0.0.1:8790
+
+	# Everything else: the web UI (which proxies /api/* to the orchestrator).
+	reverse_proxy 127.0.0.1:4310
+}
+
+*.{$PREVIEW_DOMAIN} {
+	import /etc/caddy/tls/{$TLS_MODE}.caddy
+
+	# Project previews; the orchestrator's preview proxy picks the project from the host name.
+	reverse_proxy 127.0.0.1:7777
+}

@@ -1,0 +1,12 @@
+# Let's Encrypt via the DNS-01 challenge in Azure DNS (wildcards work; the server
+# itself can stay VPN-only). Needs a public Azure DNS zone for your domain and a
+# service principal with "DNS Zone Contributor" on it. Settings: AZURE_* in .env.
+tls {
+	dns azure {
+		tenant_id {env.AZURE_TENANT_ID}
+		client_id {env.AZURE_CLIENT_ID}
+		client_secret {env.AZURE_CLIENT_SECRET}
+		subscription_id {env.AZURE_SUBSCRIPTION_ID}
+		resource_group_name {env.AZURE_DNS_RESOURCE_GROUP}
+	}
+}

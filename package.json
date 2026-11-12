@@ -1,0 +1,12 @@
+{
+  "name": "forge",
+  "private": true,
+  "packageManager": "pnpm@12.16.1",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @forge/orchestrator --filter web dev",
+    "db:up": "docker compose up -d postgres",
+    "db:push": "pnpm --filter @forge/orchestrator db:push",
+    "sandbox:build": "docker build -t forge-sandbox:dev -f sandbox/Dockerfile .",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

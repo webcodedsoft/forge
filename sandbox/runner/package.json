@@ -1,0 +1,10 @@
+{
+  "name": "forge-agent-runner",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.322",
+    "zod": "^4.6.7",
+    "playwright-core": "1.65.0"
+  }
+}

@@ -1,0 +1,9 @@
+**/node_modules
+**/.next
+**/.env
+**/.env.*
+.git
+data
+templates
+sandbox
+deploy

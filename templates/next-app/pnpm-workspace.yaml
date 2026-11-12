@@ -1,0 +1,4 @@
+storeDir: /opt/forge/pnpm-store
+allowBuilds:
+  sharp: false
+  unrs-resolver: false

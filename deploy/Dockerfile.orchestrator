@@ -1,0 +1,31 @@
+# Forge orchestrator: API, event stream, sandbox manager, preview proxy.
+# Talks to the host's Docker daemon through the mounted socket.
+FROM node:24-bookworm-slim
+
+ENV PNPM_HOME=/usr/local/share/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+
+# git + GitHub CLI for importing repos and opening pull requests.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable
+
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/protocol/package.json packages/protocol/
+COPY apps/orchestrator/package.json apps/orchestrator/
+RUN pnpm install --frozen-lockfile --filter @forge/orchestrator...
+
+COPY packages/protocol packages/protocol
+COPY apps/orchestrator apps/orchestrator
+# tsx and drizzle-kit are dev dependencies, so NODE_ENV is set only after installing.
+ENV NODE_ENV=production
+
+WORKDIR /app/apps/orchestrator
+# Imported repos are cloned here (mount a volume).
+RUN mkdir -p /app/data/repos
+CMD ["pnpm", "exec", "tsx", "src/index.ts"]

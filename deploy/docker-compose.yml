@@ -1,0 +1,73 @@
+# Forge server stack (production Azure VM and on-premises staging use the same file;
+# differences live in deploy/.env). Linux hosts only: web, orchestrator and Caddy use
+# host networking so the orchestrator reaches project sandboxes on loopback ports.
+#
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+
+name: forge
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: forge
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pg:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge"]
+      interval: 5s
+      retries: 20
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.orchestrator
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://forge:${POSTGRES_PASSWORD}@127.0.0.1:5433/forge
+      BETTER_AUTH_URL: https://${FORGE_DOMAIN}
+      PREVIEW_URL_TEMPLATE: https://{id}.${PREVIEW_DOMAIN}
+      # The model proxy listens on the docker bridge, reachable from project containers only.
+      MODEL_PROXY_HOST: 172.17.0.1
+    volumes:
+      # Starts and manages project sandbox containers. Root-equivalent on the host:
+      # keep this server on the private network only.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - repos:/app/data/repos
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - orchestrator
+
+  caddy:
+    build: caddy
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/tls:/etc/caddy/tls:ro
+      - ./certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  pg:
+  repos:
+  caddy-data:
+  caddy-config:

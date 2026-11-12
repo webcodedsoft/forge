@@ -1,0 +1,4 @@
+# Certificate issued by the company CA. Put PEM files in deploy/certs/:
+#   fullchain.pem  (must cover FORGE_DOMAIN and *.PREVIEW_DOMAIN)
+#   privkey.pem
+tls /certs/fullchain.pem /certs/privkey.pem
