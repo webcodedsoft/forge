@@ -1,5 +1,5 @@
 import type { CheckName, CheckOutcome, QaIssue, RunMode } from "@forge/protocol";
-import { TestInput } from "@forge/protocol";
+import { cleanRunError, TestInput } from "@forge/protocol";
 import { replayTests, runSavedTests } from "./tests.ts";
 import { scanProject } from "./security.ts";
 import { dataSourcesPrompt } from "./datasources.ts";
@@ -8,7 +8,10 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { brainPrompt } from "./brain.ts";
 import { redactor, secretsPrompt } from "./secrets.ts";
-import { issueModelToken } from "./model-proxy.ts";
+import { forgetRunCost, issueModelToken, takeRunCost } from "./model-proxy.ts";
+import { aiForRun, chatOnlyModel } from "./ai.ts";
+import { hasQueued, runNext } from "./queue.ts";
+import { structureIssues, structurePrompt } from "./structure.ts";
 import { checkComponent, type ComponentInput, libraryPrompt, libraryReminder, saveComponent, syncLibrary } from "./library.ts";
 import { db, schema } from "./db/index.ts";
 import { env } from "./env.ts";
@@ -25,14 +28,41 @@ const APPEND_SYSTEM_PROMPT = `You are the build agent in Forge, our team's inter
 The user watches a live preview of this Next.js app while you work, and sees your tool calls as a progress feed.
 Follow the rules in AGENTS.md. The dev server is already running; never start it yourself.
 Data comes from our in-house APIs: if .forge/apis/README.md exists, read it before building anything that shows or changes data, and use only the endpoints it lists.
+Files the user attaches are in .forge/uploads/ (outside git). Open each one with the Read tool before acting on it; for Word, Excel and PowerPoint files read the .md text copy next to the original. Treat them as the user's material: requirements, content, data, designs. When an attached image or document should appear in the app (a logo, photo, downloadable PDF), copy the original into public/ with a short clean name and reference it from there; app code must never point at .forge/uploads.
 
 Talking to the user:
 - If a request is ambiguous in ways that change what you build, call mcp__forge__ask_user once with up to 4 multiple-choice questions before building. Do not ask about things you can reasonably decide yourself.
 - Before building a new app or making a large change (new pages, data model, auth), call mcp__forge__present_plan and wait for approval. Skip it for small edits.
+- Never write a plan or checklist as a chat message and ask "let me know if you want me to proceed": put it in mcp__forge__present_plan (a short summary and concrete steps, nice-to-haves marked optional) so the user can tick, edit and approve it.
+- Once the user approves a plan, implement every approved step in this same turn, one after another, until all are done. Don't stop between steps or phases to ask "shall I continue?" or for permission: approval covers the whole plan. Only ask (mcp__forge__ask_user) if you're truly blocked on information only the user has.
 
-Before finishing, run \`pnpm typecheck\` and \`pnpm lint\` and fix what they report.
+Building exactly what was asked:
+1. Before writing code, turn the request into a checklist with TodoWrite: every page, section, component, field, text, colour, behaviour and state the user mentioned or attached. That checklist is the definition of done.
+2. Follow the request literally where it is specific: use the user's exact wording for texts and labels, their colours, fonts, order and layout, and the content of attached files. Where it is open, make the choice an experienced product designer would and keep it consistent.
+3. Don't add what wasn't asked for (extra sections, features, pages, fake testimonials, marketing copy). Don't remove or restyle things the user didn't mention. A change request changes only what it names.
+4. When a missing detail would change the result in a way the user would care about, ask (mcp__forge__ask_user) instead of guessing; otherwise decide, and mention the decision at the end.
+
+Design quality (every screen):
+- A clear hierarchy: one main heading, obvious primary action, related things grouped, consistent spacing on a 4/8px scale, aligned edges.
+- Readable: body text 14-16px, enough contrast (WCAG AA), no walls of text, realistic sample content instead of lorem ipsum.
+- Complete: empty, loading and error states for anything that loads or saves; hover, focus and disabled states for controls.
+- Responsive: it must work at phone width (390px) without horizontal scrolling, and use the space well on desktop.
+- Consistent: reuse the project's existing components, tokens and the team library before creating new ones; use lucide-react icons.
+
+Code structure (write it like a senior engineer on this team would):
+- Follow the project's existing structure, naming and patterns first. When there is none, use: src/app for routes (pages and layouts compose; they don't hold big chunks of UI or logic), src/components for reusable UI (src/components/ui for small primitives like Button, Card, Badge), src/lib for data access, API calls, formatting and business logic, src/hooks for client hooks, src/types (or a types.ts next to the code) for shared types.
+- Make a reusable component when the same UI appears twice or more (cards, list rows, badges, empty states, form fields), when a piece of a file has its own clear job, or when a file grows past ~200 lines. Give it typed props and a name that says what it is (CourseCard, not Card2); don't copy-paste markup with small variations: parameterise it.
+- Separation of concerns: components render and handle UI state; fetching, mapping API data, validation and calculations live in src/lib (or a hook), never inline in JSX. Server Components fetch data; client components stay small and only where interactivity needs them. Constants and sample data go in their own module, not inside components.
+- Don't over-abstract: no wrapper components or helpers used once, no generic "utils" dumping ground, no premature configuration. One component per file for anything reused; small private helpers may stay in the file that uses them.
+- Before finishing, re-read what you changed: extract anything repeated, split anything doing too much, and remove dead code. Forge also reviews the changed files for long files, repeated blocks and pages that load data inline, and will ask you to tidy them.
+
+Check your work like the user will:
+- After building or changing anything visible, call mcp__forge__look_at_page for each page you touched (desktop and phone). Compare the screenshots with the checklist and any attached design: layout, spacing, texts, colours, sizes, states. Fix every mismatch and look again; at most two rounds.
+- Also fix browser errors that look_at_page reports.
+- Run \`pnpm typecheck\` and \`pnpm lint\` and fix what they report.
+
 After you finish, Forge runs its own checks (install, typecheck, lint, tests, and loading every page in a browser) and saves a version only if they pass.
-End with two or three plain sentences for a non-technical teammate: what changed and what to try in the preview.`;
+End with a short message for a non-technical teammate: what changed and what to try in the preview, then the checklist with each item marked done, and plainly anything you could not do or decided yourself.`;
 
 /** Fix rounds after the first check failure before giving up and leaving changes unsaved. */
 const MAX_FIX_ROUNDS = 2;
@@ -43,8 +73,35 @@ type Active = {
   cancelled: boolean;
   cancel: () => Promise<void>;
   pendingPause?: { id: string; kind: string };
+  /** The user approved a plan in this run: the agent should build all of it without asking again. */
+  planApproved?: boolean;
+  /** Autonomous run: no plan approval or questions; Forge says "continue" whenever the agent stops to ask. */
+  autonomous?: boolean;
 };
+
+/** How many times Forge says "continue" for the agent when it stops mid-plan to ask permission. */
+const MAX_PLAN_CONTINUES = 6;
+const CONTINUE_PLAN_PROMPT =
+  "Yes, continue. The user already approved the whole plan: implement every remaining approved step now, one after another, " +
+  "without asking for permission between steps or phases. Only stop to ask if you are truly blocked (missing information only the user has). " +
+  "When everything is done, give a short summary of what you built.";
+
+/**
+ * Whether the agent ended its turn asking to go on ("Shall I continue with phase 2?", "Let me
+ * know if you want me to proceed"), judged from the end of its final message.
+ */
+export function asksToContinue(text: string | undefined): boolean {
+  if (!text) return false;
+  const tail = text.slice(-600);
+  return (
+    /\b(shall|should|would you like|do you want|want me to|ready (?:for|to)|let me know|ok(?:ay)? (?:to|if)|go ahead|confirm)\b[^.!]{0,160}\b(continue|proceed|next|phase|step|move on|start|implement|build|carry on)\b/i.test(tail) ||
+    /\b(continue|proceed|next phase|next step|move on)\b[^.!?]{0,80}\?\s*$/i.test(tail.trim())
+  );
+}
 const active = new Map<string, Active>();
+
+/** Whether the agent is working on this project (a build, chat or QA run). */
+export const isRunning = (projectId: string) => active.has(projectId);
 
 export const activeRunId = (projectId: string) => active.get(projectId)?.runId ?? null;
 
@@ -75,7 +132,12 @@ const DESIGN_MODE_PROMPT = `Design mode: the user attached a design (a screensho
 - Icons: lucide-react, picking the closest match to the design's icon.
 - Make it responsive (it must work on a phone too) and accessible (real buttons and links, labels, alt text, contrast).
 - Wire up the obvious interactions (navigation, buttons, forms) with sensible behaviour; don't leave dead controls.
+- Then call mcp__forge__look_at_page (desktop and phone) and compare the result with the attached image side by side: layout, spacing, sizes, colours, fonts and texts. Fix differences and look again (at most two rounds).
 - At the end, list anything you couldn't match exactly and why.`;
+
+/** Autonomous projects: build the whole request without stopping for approval or questions. */
+const AUTONOMOUS_PROMPT = `## Autonomous mode
+The user turned on Autonomous for this project: build the whole request from start to finish in this turn. Don't present a plan for approval and don't ask questions or permission (those tools are off); when something is unclear, choose the most sensible option and keep going. Work through every part of the request without stopping between phases. At the end, list the assumptions you made so the user can adjust them.`;
 
 /** Chat mode: the same agent session, but this turn only reads and answers. */
 const CHAT_MODE_PROMPT = `## Chat mode (this message only)
@@ -114,6 +176,8 @@ function summarize(tool: string, input: unknown): string {
       return `Press ${str(i.key)}`;
     case "mcp__browser__report_issue":
       return `${str(i.severity)}: ${str(i.title)}`;
+    case "mcp__forge__look_at_page":
+      return `${str(i.path) || "/"}${Array.isArray(i.viewports) ? ` · ${(i.viewports as string[]).join(" and ")}` : " · desktop and phone"}`;
     case "mcp__browser__propose_test":
       return `Test: ${str(i.title)}`;
     default:
@@ -121,7 +185,17 @@ function summarize(tool: string, input: unknown): string {
   }
 }
 
-export async function startRun(projectId: string, prompt: string, user: { id: string; name: string }, mode: RunMode = "build") {
+/** The model picked for each running run ("provider:model"), read by every turn of it. */
+const runModel = new Map<string, string | null>();
+
+export async function startRun(
+  projectId: string,
+  prompt: string,
+  user: { id: string; name: string },
+  mode: RunMode = "build",
+  /** "provider:model" from the prompt box; undefined: the project's last choice. */
+  model?: string | null,
+) {
   if (active.has(projectId)) throw new RunConflictError("A run is already in progress for this project.");
   const runId = nanoid(10);
   const entry: Active = { runId, cancelled: false, cancel: async () => {} };
@@ -137,12 +211,24 @@ export async function startRun(projectId: string, prompt: string, user: { id: st
   };
 
   try {
+    // A pick in the prompt box becomes the project's choice; otherwise use its last one.
+    if (model !== undefined) await db.update(schema.project).set({ lastModel: model }).where(eq(schema.project.id, projectId));
+    const [proj] = model === undefined ? await db.select({ lastModel: schema.project.lastModel }).from(schema.project).where(eq(schema.project.id, projectId)) : [];
+    let choice = model !== undefined ? model : (proj?.lastModel ?? null);
+    // A chat-only model can't build: anything but Chat uses the default then.
+    if (mode !== "chat" && (await chatOnlyModel(choice))) choice = null;
+    runModel.set(runId, choice);
+    // Autonomous projects build without stopping to ask (Plan mode still asks; Chat doesn't build).
+    const [flags] = await db.select({ autonomous: schema.project.autonomous }).from(schema.project).where(eq(schema.project.id, projectId));
+    entry.autonomous = Boolean(flags?.autonomous) && mode !== "plan" && mode !== "chat";
+    const ai = await aiForRun(choice).catch(() => null);
     await appendEvent({
       type: "run.started",
       projectId,
       runId,
       prompt,
-      model: env.FORGE_MODEL,
+      model: ai?.model ?? choice ?? "",
+      ...(ai ? { modelLabel: ai.label, provider: ai.provider } : {}),
       userId: user.id,
       userName: user.name,
       ...(mode !== "build" ? { mode } : {}),
@@ -150,20 +236,27 @@ export async function startRun(projectId: string, prompt: string, user: { id: st
     await db.update(schema.project).set({ status: "running" }).where(eq(schema.project.id, projectId));
   } catch (err) {
     active.delete(projectId);
+    runModel.delete(runId);
     throw err;
   }
 
   void execute(projectId, runId, prompt, entry, mode)
     .catch(() => false)
-    .then((committed) => {
+    .then(async (committed) => {
       active.delete(projectId);
+      runModel.delete(runId);
+      forgetRunCost(runId);
       void settleFixRun(projectId, runId, committed).catch((e) => console.error("could not settle fixed problems", e));
-      // A new version: security scan and saved tests (no AI), then the optional AI auto-test.
+      // Messages sent while it worked come next (not after Stop: people may want to rethink).
+      const queued = !entry.cancelled && (await hasQueued(projectId).catch(() => false));
+      if (queued) void runNext(projectId).catch((e) => console.error("queued message did not start", e));
+      // A new version: security scan and saved tests (no AI), then the optional AI auto-test
+      // (skipped when a queued message is up next; the next version will be tested).
       if (committed) {
         void scanProject(projectId).catch((e) => console.error("security scan did not run", e));
         void runSavedTests(projectId, "version")
           .catch((e) => console.error("saved tests did not run", e))
-          .then(() => maybeAutoQa(projectId, prompt))
+          .then(() => (queued ? undefined : maybeAutoQa(projectId, prompt)))
           .catch((e) => console.error("auto QA did not start", e));
       }
     });
@@ -186,7 +279,7 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
     const note = await staleFilesNote(projectId, runId);
     const modePrefix =
       mode === "plan"
-        ? "Plan mode: before changing anything, write a detailed spec for this request (what the user gets, pages and components, data and API calls, edge cases, how you'll check it) and call mcp__forge__present_plan. Build only after the user approves it.\n\n"
+        ? "Plan mode: before changing anything, work out a detailed spec for this request (what the user gets, pages and components, data and API calls, edge cases, how you'll check it) and call mcp__forge__present_plan with it as a summary and concrete steps (one change per step, nice-to-haves marked optional). Build only after the user approves it.\n\n"
         : mode === "design"
           ? DESIGN_MODE_PROMPT + "\n\n"
           : "";
@@ -199,12 +292,36 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
       error = turn.error;
     }
 
+    let continues = 0;
+    let structureReviewed = false;
     for (let round = 0; mode !== "chat"; round++) {
-      const turn = await agentTurn(projectId, runId, turnPrompt);
+      const turn = await agentTurn(projectId, runId, turnPrompt, undefined, { autonomous: entry.autonomous });
       status = turn.status;
       error = turn.error;
       if (status !== "completed" || entry.cancelled) break;
+      // After an approved plan the agent should build all of it. If it stops to ask permission for
+      // the next phase, answer for the user and keep going (this isn't a fix round).
+      if ((entry.planApproved || entry.autonomous) && continues < MAX_PLAN_CONTINUES && asksToContinue(turn.result)) {
+        continues++;
+        await appendEvent({ type: "notice", projectId, runId, text: entry.autonomous ? "Autonomous: continuing without asking…" : "Continuing with the approved plan…" });
+        turnPrompt = CONTINUE_PLAN_PROMPT;
+        round--;
+        continue;
+      }
       if (!(await hasChanges(projectId))) break; // nothing to check or save
+
+      // Once per run: review the changed files' structure (long files, repeated blocks, pages that
+      // load data inline) and give the agent one round to tidy them before the checks.
+      if (!structureReviewed) {
+        structureReviewed = true;
+        const issues = await structureIssues(projectId).catch(() => []);
+        if (issues.length && !entry.cancelled) {
+          await appendEvent({ type: "notice", projectId, runId, text: `Tidying the code structure (${issues.length} thing${issues.length === 1 ? "" : "s"} to improve)…` });
+          turnPrompt = structurePrompt(issues);
+          round--;
+          continue;
+        }
+      }
 
       const result = await runChecks(projectId, runId, round + 1);
       if (entry.cancelled) {
@@ -230,7 +347,8 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
   if (status === "cancelled" && entry.cancelled) error = undefined;
   unsaved = await hasChanges(projectId).catch(() => false);
 
-  await appendEvent({ type: "run.finished", projectId, runId, status, error, unsaved }).catch((e) =>
+  if (error) console.error(`run ${runId} failed:`, error);
+  await appendEvent({ type: "run.finished", projectId, runId, status, error: error ? cleanRunError(error) : undefined, unsaved }).catch((e) =>
     console.error("could not record run.finished", e),
   );
   await db
@@ -247,8 +365,15 @@ async function agentTurn(
   runId: string,
   prompt: string,
   qa?: { systemPrompt: string; onIssue: (issue: QaIssue) => void; onTest?: (test: unknown) => void },
-  opts: { readOnly?: boolean } = {},
+  opts: { readOnly?: boolean; autonomous?: boolean } = {},
 ): Promise<{ status: TurnStatus; error?: string; result?: string }> {
+  // The AI chosen in Settings › Integrations › AI model, read at the start of every turn.
+  let ai: Awaited<ReturnType<typeof aiForRun>>;
+  try {
+    ai = await aiForRun(runModel.get(runId));
+  } catch (err) {
+    return { status: "failed", error: err instanceof Error ? err.message : String(err) };
+  }
   let status = "failed" as TurnStatus;
   let error: string | undefined;
   let result: string | undefined;
@@ -292,15 +417,17 @@ async function agentTurn(
   const libraryNote = qa ? "" : await libraryReminder();
   const redact = await redactor(projectId);
   const input = qa
-    ? { prompt, mode: "qa", model: env.FORGE_MODEL, appendSystemPrompt: [qa.systemPrompt, brainText].filter(Boolean).join("\n\n") }
+    ? { prompt, mode: "qa", model: ai.model, appendSystemPrompt: [qa.systemPrompt, brainText].filter(Boolean).join("\n\n") }
     : {
         prompt: opts.readOnly ? prompt : prompt + libraryNote,
         readOnly: opts.readOnly || undefined,
+        autonomous: opts.autonomous || undefined,
         sessionId: proj?.sessionId ?? undefined,
-        model: env.FORGE_MODEL,
+        model: ai.model,
         appendSystemPrompt: [
           APPEND_SYSTEM_PROMPT,
           opts.readOnly ? CHAT_MODE_PROMPT : "",
+          opts.autonomous ? AUTONOMOUS_PROMPT : "",
           importedText,
           secretsText,
           dataText,
@@ -315,7 +442,7 @@ async function agentTurn(
   let chain: Promise<unknown> = Promise.resolve();
   const queue = (fn: () => Promise<unknown>) => (chain = chain.then(fn).catch((e) => console.error("event append failed", e)));
 
-  const modelAccess = env.ANTHROPIC_API_KEY ? issueModelToken(projectId, runId) : null;
+  const modelAccess = issueModelToken(projectId, runId, ai);
   const exitCode = await execLines(
     projectId,
     ["node", "/opt/forge/runner/runner.mjs"],
@@ -323,7 +450,10 @@ async function agentTurn(
       env: [
         `FORGE_INPUT_B64=${Buffer.from(JSON.stringify(input)).toString("base64")}`,
         // A run-scoped token for the model proxy; the real API key never enters the container.
-        ...(modelAccess ? [`ANTHROPIC_API_KEY=${modelAccess.token}`, `ANTHROPIC_BASE_URL=${env.MODEL_PROXY_URL_FOR_SANDBOX}`] : []),
+        `ANTHROPIC_API_KEY=${modelAccess.token}`,
+        `ANTHROPIC_BASE_URL=${env.MODEL_PROXY_URL_FOR_SANDBOX}`,
+        // Small background steps (titles, command checks) use the fast model, when one is set.
+        ...(ai.fastModel ? [`ANTHROPIC_SMALL_FAST_MODEL=${ai.fastModel}`, `ANTHROPIC_DEFAULT_HAIKU_MODEL=${ai.fastModel}`] : []),
       ],
     },
     (raw) => {
@@ -377,6 +507,8 @@ async function agentTurn(
           publish(projectId, { type: "delta", projectId, runId, text: redact(line.text) });
           break;
         case "assistant":
+          // Provider errors the agent echoes as a message are shown on the failure line instead.
+          if (/^\s*API Error:/i.test(line.text)) break;
           queue(() => appendEvent({ type: "assistant.message", projectId, runId, text: redact(line.text) }));
           break;
         case "tool_call":
@@ -406,7 +538,13 @@ async function agentTurn(
               inputTokens: line.inputTokens,
               outputTokens: line.outputTokens,
               cacheReadTokens: line.cacheReadTokens,
-              costUsd: Math.max(0, line.costUsd - priorSessionCost),
+              // ChatGPT runs: the real cost Forge's model proxy priced per request. The agent's own
+              // figure assumes Claude prices (it's still kept as sessionCostUsd for later Claude turns).
+              ...(() => {
+                if (ai.provider !== "openai") return { costUsd: Math.max(0, line.costUsd - priorSessionCost) };
+                const c = takeRunCost(runId);
+                return { costUsd: c?.usd ?? 0, pricedBy: "forge" as const, ...(c?.unpriced ? { costEstimated: true } : {}) };
+              })(),
               ...(qa ? {} : { sessionCostUsd: line.costUsd }),
             }),
           );
@@ -431,7 +569,7 @@ async function agentTurn(
     (text) => {
       stderrTail = (stderrTail + text).slice(-2000);
     },
-  ).finally(() => modelAccess?.revoke());
+  ).finally(() => modelAccess.revoke());
   await chain;
   if (exitCode !== 0 && status === "completed") status = "failed";
   if (status === "failed" && !error) error = stderrTail.trim() || `Runner exited with code ${exitCode}`;
@@ -473,7 +611,10 @@ export async function startQa(projectId: string, user: { id: string; name: strin
         : focus
           ? `Automatic test after: ${focus.split("\n")[0]!.slice(0, 200)}`
           : "Test the app in a browser and report problems",
-      model: env.FORGE_MODEL,
+      ...(await aiForRun().then(
+        (ai) => ({ model: ai.model, modelLabel: ai.label, provider: ai.provider }),
+        () => ({ model: "" }),
+      )),
       userId: user.id,
       userName: user.name,
       mode: "qa",
@@ -482,7 +623,11 @@ export async function startQa(projectId: string, user: { id: string; name: strin
     active.delete(projectId);
     throw err;
   }
-  void executeQa(projectId, runId, entry, focus, testRequest).finally(() => active.delete(projectId));
+  void executeQa(projectId, runId, entry, focus, testRequest).finally(() => {
+    active.delete(projectId);
+    forgetRunCost(runId);
+    if (!entry.cancelled) void runNext(projectId).catch((e) => console.error("queued message did not start", e));
+  });
   return runId;
 }
 
@@ -544,7 +689,8 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
     status = "failed";
     error = err instanceof Error ? err.message : String(err);
   }
-  await appendEvent({ type: "run.finished", projectId, runId, status, error: status === "cancelled" ? undefined : error, unsaved: false }).catch(
+  if (error && status !== "cancelled") console.error(`test run ${runId} failed:`, error);
+  await appendEvent({ type: "run.finished", projectId, runId, status, error: status === "cancelled" || !error ? undefined : cleanRunError(error), unsaved: false }).catch(
     (e) => console.error("could not record run.finished", e),
   );
 }
@@ -686,6 +832,7 @@ export async function answerPause(projectId: string, pauseId: string, answer: un
     pauseId,
   ]);
   if (r.exitCode !== 0) throw new Error(`Could not deliver the answer: ${r.stderr || r.stdout}`);
+  if (a.pendingPause.kind === "plan" && (answer as { decision?: string }).decision === "approve") a.planApproved = true;
   a.pendingPause = undefined;
   await appendEvent({ type: "resume", projectId, runId: a.runId, pauseId, answer: { ...(answer as object), by: user.name } });
 }
@@ -761,4 +908,34 @@ async function qaCentsToday<T>(projectId: string): Promise<T[]> {
     where u.project_id = ${projectId} and u.type = 'usage'
       and r.payload->>'mode' = 'qa' and r.at >= date_trunc('day', now())`);
   return rows as unknown as T[];
+}
+
+/**
+ * Runs cut off by an orchestrator restart never got a run.finished event, so the builder would
+ * show them as running forever. On startup: stop any agent process left in their sandbox, close
+ * them as failed (with a clear reason), and reset the project's status. Their file changes stay
+ * in the workspace as unsaved changes.
+ */
+export async function recoverInterruptedRuns(): Promise<void> {
+  const open = await db.execute<{ project_id: string; run_id: string }>(sql`
+    select s.project_id, s.run_id from project_event s
+    where s.type = 'run.started'
+      and not exists (select 1 from project_event f where f.run_id = s.run_id and f.type = 'run.finished')`);
+  for (const { project_id: projectId, run_id: runId } of open) {
+    if (active.has(projectId)) continue;
+    await exec(projectId, ["sh", "-c", 'pkill -TERM -f "[/]opt/forge/runner/runner.mjs"; pkill -TERM -f "[/]opt/forge/checks/checks.mjs"; true'], {
+      user: "root",
+    }).catch(() => undefined);
+    const unsaved = await hasChanges(projectId).catch(() => false);
+    await appendEvent({
+      type: "run.finished",
+      projectId,
+      runId,
+      status: "failed",
+      error: "Interrupted: Forge restarted while the agent was working. Changes it made so far are kept; send a message to continue.",
+      ...(unsaved ? { unsaved: true } : {}),
+    });
+    await db.update(schema.project).set({ status: "error" }).where(eq(schema.project.id, projectId));
+    console.log(`closed interrupted run ${runId} (${projectId})`);
+  }
 }

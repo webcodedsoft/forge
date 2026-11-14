@@ -1,9 +1,18 @@
 "use client";
 
-import type { AppProblem, CommentAnchor, Project, ProjectComment, ProposedTest, RunEvent, RunMode, SandboxStatus, TestInput } from "@forge/protocol";
+import { cleanRunError } from "@forge/protocol";
+import type { AppProblem, CommentAnchor, Project, ProjectComment, ProposedTest, ProjectModels, QueuedMessage, RunEvent, RunMode, SandboxStatus, TestInput } from "@forge/protocol";
 import { failedTestPrompt, StepList } from "./test-steps";
 import { HealthPanel } from "./health-panel";
+import { AgentWorking, currentActivity } from "./agent-working";
+import { QueueList } from "./queue-list";
+import { PreviewOffline, usePreviewReachable } from "./preview-health";
+import { PlanPanel, PlanSummaryCard } from "./plan-panel";
+import { onPreviewAccessRequest, usePreviewEntry } from "./preview-entry";
+import { SharePreviewModal } from "./share-preview";
+import { splitAttachments, splitElementContext } from "@/lib/prompt-parts";
 import { ForgeLoader, Spinner } from "@/components/loading";
+import { AttachmentIcon, attachmentProblem, AttachmentPreview, attachmentSuffix, AttachmentThumb, isImagePath, uploadFiles } from "@/lib/uploads";
 import { GitHubButton } from "./github-button";
 import { useSession } from "@/lib/auth-client";
 import { SecretsButton } from "./secrets-button";
@@ -15,7 +24,7 @@ import { DrawLayer, ReviewToolbar, type ReviewTool, setPreviewTheme, setToolbarP
 import { PANEL_DEFAULT, PANEL_MAX, PANEL_MIN, setPanelPrefs, usePanelPrefs } from "@/lib/panel-prefs";
 import { CodeView } from "./code-view";
 import { type ComparePair, CompareView } from "./compare-view";
-import { ComposerMenu, ModeSelect } from "./composer-menu";
+import { AutoToggle, ComposerMenu, ModelPicker, ModeSelect } from "./composer-menu";
 import { routesFromFiles } from "@/lib/routes";
 import {
   Brain,
@@ -35,18 +44,20 @@ import {
   Hammer,
   HeartPulse,
   History,
-  ImageIcon,
   Info,
   Layers,
   Link2,
   ListChecks,
   MessageCircleQuestion,
+  ListPlus,
   MessagesSquare,
+  Pencil,
+  Sparkles,
+  Square,
   Minus,
   PanelBottom,
   PanelLeftClose,
   PanelLeftOpen,
-  Paperclip,
   Power,
   RotateCw,
   SendHorizontal,
@@ -77,7 +88,7 @@ type Item =
   | { kind: "text"; e: Extract<RunEvent, { type: "assistant.message" }> }
   | { kind: "tool"; row: ToolRow }
   | { kind: "commit"; e: Extract<RunEvent, { type: "commit" }> }
-  | { kind: "usage"; e: Extract<RunEvent, { type: "usage" }> }
+  | { kind: "usage"; e: Extract<RunEvent, { type: "usage" }>; model?: string }
   | { kind: "finished"; e: Extract<RunEvent, { type: "run.finished" }> }
   | { kind: "answered"; pause: Extract<RunEvent, { type: "pause" }>; answer: Extract<RunEvent, { type: "resume" }> }
   | { kind: "checking"; e: Extract<RunEvent, { type: "check.started" }> }
@@ -95,6 +106,8 @@ function toItems(events: RunEvent[]): Item[] {
   const items: Item[] = [];
   const tools = new Map<string, ToolRow>();
   const pauses = new Map<string, Extract<RunEvent, { type: "pause" }>>();
+  // Which model answered each run (shown on its cost line).
+  const models = new Map<string, string>();
   for (const e of events) {
     switch (e.type) {
       case "pause":
@@ -106,9 +119,13 @@ function toItems(events: RunEvent[]): Item[] {
         break;
       }
       case "run.started":
+        if (e.model) models.set(e.runId, e.modelLabel ?? e.model);
         items.push({ kind: "prompt", e });
         break;
       case "assistant.message":
+        // The agent echoes provider errors as a message ("API Error: 429 …"); the run's failure
+        // line already shows them, cleaned up.
+        if (/^\s*API Error:/i.test(e.text)) break;
         items.push({ kind: "text", e });
         break;
       case "tool.call": {
@@ -157,7 +174,7 @@ function toItems(events: RunEvent[]): Item[] {
         items.push({ kind: "push", e });
         break;
       case "usage":
-        items.push({ kind: "usage", e });
+        items.push({ kind: "usage", e, model: models.get(e.runId) });
         break;
       case "run.finished":
         items.push({ kind: "finished", e });
@@ -176,7 +193,20 @@ export function ProjectView() {
   const [prompt, setPrompt] = useState("");
   const [sending, setSending] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
-  const { events, streaming, connected, caughtUp, qaFrame, presence, commentsVersion, problemsVersion, securityVersion } = useProjectEvents(id);
+  const { events, streaming, connected, caughtUp, qaFrame, presence, commentsVersion, problemsVersion, securityVersion, queueVersion, projectVersion, resync } =
+    useProjectEvents(id);
+  // The project's details changed on the server (e.g. Forge gave it a better name): refresh them.
+  useEffect(() => {
+    if (!projectVersion) return;
+    let live = true;
+    api.getProject(id).then(
+      (p) => live && setProject((cur) => (cur ? { ...cur, name: p.name } : cur)),
+      () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, [id, projectVersion]);
   const { data: session } = useSession();
   const meId = session?.user.id;
   const feedEnd = useRef<HTMLDivElement>(null);
@@ -218,6 +248,7 @@ export function ProjectView() {
   const [mode, setMode] = useState<RunMode>("build");
   const [attachments, setAttachments] = useState<{ path: string; name: string; type: string }[]>([]);
   const [importingFigma, setImportingFigma] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [menu, setMenu] = useState<{ open: boolean; startIn: "root" | "context"; query: string }>({ open: false, startIn: "root", query: "" });
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -267,10 +298,10 @@ export function ProjectView() {
   const showError = useCallback((msg: string) => setError(msg), []);
 
   const items = useMemo(() => toItems(events), [events]);
+  // Running: the latest run has no run.finished yet (checked by run id, not by counting).
   const running = useMemo(() => {
-    const started = events.filter((e) => e.type === "run.started").length;
-    const finished = events.filter((e) => e.type === "run.finished").length;
-    return started > finished;
+    const last = events.findLast((e) => e.type === "run.started");
+    return Boolean(last && !events.some((e) => e.type === "run.finished" && e.runId === last.runId));
   }, [events]);
   // The agent is waiting for the user: the latest pause has no answer and its run is still going.
   const pendingPause = useMemo(() => {
@@ -279,6 +310,102 @@ export function ProjectView() {
     const last = [...events].reverse().find((e) => e.type === "pause");
     return last && last.type === "pause" && !answered.has(last.pauseId) ? last : null;
   }, [events, running]);
+  // When the preview can't be reached, Forge's own panel covers the frame (not the browser's error page).
+  const reloadPreview = useCallback(() => setPreviewKey((k) => k + 1), []);
+  const preview = usePreviewReachable(sandbox?.previewUrl, reloadPreview);
+  const runCount = useMemo(() => events.filter((e) => e.type === "run.started").length, [events]);
+  // Models the admin allows (the picker next to the mode). Reloaded when the tab regains focus,
+  // so a change in Settings shows up without a reload.
+  const [models, setModels] = useState<ProjectModels | null>(null);
+  const [modelKey, setModelKey] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    const load = () =>
+      api.projectModels(id).then(
+        (m) => {
+          if (!live) return;
+          setModels(m);
+          setModelKey((k) => (k && m.models.some((x) => x.key === k && x.available) ? k : m.currentKey));
+        },
+        () => undefined,
+      );
+    void load();
+    window.addEventListener("focus", load);
+    return () => {
+      live = false;
+      window.removeEventListener("focus", load);
+    };
+    // runCount: reload when any run starts, so the picker shows what the server will use.
+  }, [id, runCount]);
+  // A chat-only model can't build: outside Chat mode the picker and the request use the default.
+  const effectiveModelKey = (() => {
+    if (!models || !modelKey) return modelKey;
+    const m = models.models.find((x) => x.key === modelKey);
+    return m && !m.canCode && mode !== "chat" ? models.defaultKey : modelKey;
+  })();
+  // Messages waiting for the agent (orchestrator queue.ts), refetched when the server says so.
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const refreshQueue = useCallback(() => api.queue(id).then(setQueue, () => undefined), [id]);
+  useEffect(() => {
+    let live = true;
+    api.queue(id).then((q) => live && setQueue(q), () => undefined);
+    return () => {
+      live = false;
+    };
+  }, [id, queueVersion]);
+  // The project's Autonomous switch (prompt box toggle and mode menu): saved right away, undone on error.
+  const setAutonomous = useCallback(
+    (on: boolean) => {
+      setProject((p) => (p ? { ...p, autonomous: on } : p));
+      api.updateSettings(id, { autonomous: on }).catch((e) => {
+        setProject((p) => (p ? { ...p, autonomous: !on } : p));
+        setError(errText(e));
+      });
+    },
+    [id],
+  );
+  // Previews are private: the frame opens through an entry link that gives this browser a pass.
+  // `accessEpoch` goes up when the preview asks for access again (its pass expired).
+  const [accessEpoch, setAccessEpoch] = useState(0);
+  const previewEntry = usePreviewEntry(id, Boolean(sandbox?.previewUrl), { next: currentPath, reloadKey: `${previewKey}:${accessEpoch}` });
+  const [sharing, setSharing] = useState(false);
+  // A plan with steps opens the Plan panel over the preview; "Hide" tucks it away until reopened.
+  const planHasSteps = Boolean(
+    pendingPause?.kind === "plan" && ((pendingPause.payload as { steps?: unknown[] } | null)?.steps?.length ?? 0) > 0,
+  );
+  const [hiddenPlan, setHiddenPlan] = useState<string | null>(null);
+  const planOpen = Boolean(planHasSteps && canBuild && pendingPause && hiddenPlan !== pendingPause.pauseId);
+  // What the agent is doing right now (the bar at the bottom of the chat).
+  const activity = useMemo(() => (running ? currentActivity(events, Boolean(streaming?.text)) : null), [running, events, streaming?.text]);
+  const runStartedAt = useMemo(() => (running ? events.findLast((e) => e.type === "run.started")?.at : undefined), [running, events]);
+  // Stop was pressed for this run (by its start time), so a later run starts with Stop enabled.
+  const [stoppingRun, setStoppingRun] = useState<string | null>(null);
+  const stopping = running && stoppingRun !== null && stoppingRun === (runStartedAt ?? "");
+  const stopRun = useCallback(() => {
+    setStoppingRun(runStartedAt ?? "");
+    api.cancelRun(id).then(
+      (r) => {
+        // Nothing to stop on the server: this page missed the run's end. Reload the events.
+        if (!r.cancelled) {
+          setStoppingRun(null);
+          resync();
+        }
+      },
+      (e) => {
+        setStoppingRun(null);
+        setError(errText(e));
+      },
+    );
+  }, [id, runStartedAt, resync]);
+  // The browser tab says so too, so people can switch away and see when it's done.
+  useEffect(() => {
+    if (!running || !project) return;
+    const before = document.title;
+    document.title = `${pendingPause ? "Waiting for you" : "Working…"} · ${project.name}`;
+    return () => {
+      document.title = before;
+    };
+  }, [running, pendingPause, project]);
   const commitCount = useMemo(
     // Anything that changes the files: a saved version, a discard, or switching lines (ideas).
     () => events.filter((e) => e.type === "commit" || e.type === "changes.discarded" || e.type === "branch").length,
@@ -339,6 +466,23 @@ export function ProjectView() {
     return () => clearInterval(t);
   }, [id, sandbox?.state, sandbox?.stage]);
 
+  // While a run shows as active, check with the server now and then. If it has no active run
+  // twice in a row, this page missed the run's end (e.g. the connection died during sleep): reload.
+  useEffect(() => {
+    if (!running) return;
+    let misses = 0;
+    const t = setInterval(() => {
+      api.sandbox(id).then(
+        (s) => {
+          misses = s.activeRunId ? 0 : misses + 1;
+          if (misses >= 2) resync();
+        },
+        () => undefined,
+      );
+    }, 30_000);
+    return () => clearInterval(t);
+  }, [id, running, resync]);
+
   // Visual edit: the preview's inspector script posts the clicked element back here.
   type Picked = { tag: string; text: string; role: string; classes: string; path: string; section: string; url: string; html: string };
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -347,6 +491,10 @@ export function ProjectView() {
   const [inspectFor, setInspectFor] = useState<"edit" | "comment" | "text">("edit");
   const [picked, setPicked] = useState<Picked | null>(null);
   const previewOrigin = sandbox?.previewUrl ? new URL(sandbox.previewUrl).origin : null;
+  useEffect(() => {
+    if (!previewOrigin) return;
+    return onPreviewAccessRequest([previewOrigin], () => setAccessEpoch((n) => n + 1));
+  }, [previewOrigin]);
   const toggleInspect = (on: boolean, purpose: "edit" | "comment" | "text" = "edit") => {
     setInspecting(on);
     setInspectFor(purpose);
@@ -488,6 +636,7 @@ export function ProjectView() {
   const pushCount = useMemo(() => events.filter((e) => e.type === "github.push" || e.type === "pull_request").length, [events]);
   const testEvents = useMemo(() => events.filter((e) => e.type === "tests.result" || e.type === "qa.report").length, [events]);
   const pinsScroll = useRef(false);
+  const [missingPins, setMissingPins] = useState<Set<string>>(() => new Set());
   const sendPins = useCallback(() => {
     if (!previewOrigin) return;
     const pins = threads
@@ -497,6 +646,11 @@ export function ProjectView() {
         n: t.n,
         page: t.anchor!.page,
         selector: t.anchor!.selector,
+        // What the preview needs to find the element again if the page changed since.
+        tag: t.anchor!.tag,
+        html: t.anchor!.html,
+        text: t.anchor!.text,
+        section: t.anchor!.section,
         title: `${t.userName}: ${t.body.slice(0, 80)}`,
         active: t.id === activeComment,
       }));
@@ -572,6 +726,11 @@ export function ProjectView() {
         scrollWaiter.current = null;
       } else if (e.data?.type === "forge:open-palette") {
         window.dispatchEvent(new Event("forge:open-palette"));
+      } else if (e.data?.type === "forge:pin-reanchor" && typeof e.data.id === "string" && typeof e.data.selector === "string") {
+        // The preview found a pinned element again after the page changed: remember its new path.
+        api.updateComment(id, e.data.id, { selector: e.data.selector }).catch(() => undefined);
+      } else if (e.data?.type === "forge:pins-missing" && Array.isArray(e.data.ids)) {
+        setMissingPins(new Set((e.data.ids as unknown[]).filter((x): x is string => typeof x === "string")));
       } else if (e.data?.type === "forge:pin-click" && typeof e.data.id === "string") {
         activateComment(e.data.id);
         setTab("comments");
@@ -584,7 +743,7 @@ export function ProjectView() {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [previewOrigin, inspecting, inspectFor, sendPins, onLocation, currentPath, splitId]);
+  }, [id, previewOrigin, inspecting, inspectFor, sendPins, onLocation, currentPath, splitId]);
 
   // Reload the preview when a run finishes or a version is restored (HMR covers most edits).
   const lastFinished = useMemo(() => events.filter((e) => e.type === "run.finished").length, [events]);
@@ -606,20 +765,17 @@ export function ProjectView() {
     iframeRef.current?.contentWindow?.postMessage({ type: "forge:nav", action, path }, previewOrigin);
   };
 
-  async function attach(list: FileList) {
+  async function attach(list: FileList | File[]) {
+    const files = Array.from(list);
+    const problem = attachmentProblem(files, attachments.length);
+    if (problem) return setError(problem);
     setUploading(true);
     setError(null);
     try {
-      for (const f of Array.from(list).slice(0, 6)) {
-        if (f.size > 10 * 1024 * 1024) throw new Error(`${f.name} is larger than 10 MB.`);
-        const dataBase64 = await new Promise<string>((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(String(r.result).split(",")[1] ?? "");
-          r.onerror = () => reject(new Error(`Could not read ${f.name}.`));
-          r.readAsDataURL(f);
-        });
-        const saved = await api.upload(id, { name: f.name, type: f.type || "text/plain", dataBase64 });
-        setAttachments((a) => [...a, { path: saved.path, name: f.name, type: saved.type }]);
+      // One at a time, so each chip appears as soon as its file is saved.
+      for (const f of files) {
+        const [saved] = await uploadFiles(id, [f]);
+        setAttachments((a) => [...a, saved!]);
       }
     } catch (e) {
       setError(errText(e));
@@ -661,7 +817,8 @@ export function ProjectView() {
   async function send(e?: React.FormEvent) {
     e?.preventDefault();
     const text = prompt.trim();
-    if (!text || running || sending) return;
+    // While the agent works, the message joins the queue (it runs when the agent is done).
+    if (!text || sending || pendingPause) return;
     setSending(true);
     setError(null);
     const withElement0 = picked
@@ -675,11 +832,10 @@ export function ProjectView() {
         ].join("\n")
       : text;
     // Attached files live in .forge/uploads/; the agent opens them with its Read tool (images too).
-    const withElement = attachments.length
-      ? `${withElement0}\n\n(Attached files, open them with the Read tool: ${attachments.map((a) => a.path).join(", ")})`
-      : withElement0;
+    const withElement = withElement0 + attachmentSuffix(attachments);
     try {
-      await api.startRun(id, withElement, mode);
+      const r = await api.startRun(id, withElement, mode, models && models.models.length > 1 ? (effectiveModelKey ?? undefined) : undefined);
+      if (r.queued) void refreshQueue();
       setPrompt("");
       setPicked(null);
       setAttachments([]);
@@ -745,7 +901,18 @@ export function ProjectView() {
     <main className="flex h-dvh min-h-0 flex-col bg-paper">
       {/* Top bar: project switcher, modes, go-to search, project actions */}
       <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-2.5">
-        <ProjectSwitcher projectId={id} name={project?.name ?? "…"} />
+        <ProjectSwitcher
+          projectId={id}
+          name={project?.name ?? "…"}
+          onRename={
+            canBuild && project
+              ? async (name) => {
+                  const updated = await api.updateSettings(id, { name });
+                  setProject((p) => (p ? { ...p, name: updated.name } : p));
+                }
+              : undefined
+          }
+        />
         <div role="tablist" aria-label="Mode" className="seg">
           {MODES.map((m) => (
             <button key={m.id} role="tab" aria-selected={tab === m.id} onClick={() => setTab(m.id)} className="mode">
@@ -907,6 +1074,7 @@ export function ProjectView() {
                 onDraftDone={() => setDraftAnchor(null)}
                 onAskAgent={canBuild ? askAgent : undefined}
                 onError={showError}
+                missingPins={missingPins}
               />
             </div>
           ) : tab === "versions" ? (
@@ -940,7 +1108,7 @@ export function ProjectView() {
               />
             </div>
           ) : (
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overflow-x-hidden p-4">
               {items.length === 0 && !streaming && (
                 <p className="text-ink-2">Describe what to build or change. The agent edits the app and you see it update on the right.</p>
               )}
@@ -966,11 +1134,24 @@ export function ProjectView() {
                     }}
                   />
                 ) : (
-                  <FeedItem key={i} item={it} />
+                  <FeedItem key={i} item={it} projectId={id} />
                 ),
               )}
-              {streaming && <p className="whitespace-pre-wrap text-ink">{streaming.text}</p>}
-              {pendingPause && canBuild && <PauseCard key={pendingPause.pauseId} projectId={id} pause={pendingPause} onError={showError} />}
+              {streaming && <Markdown className="leading-relaxed text-ink">{streaming.text}</Markdown>}
+              {activity && !pendingPause && (
+                <AgentWorking
+                  startedAt={runStartedAt}
+                  title={activity.title}
+                  detail={activity.detail}
+                  onStop={canBuild ? stopRun : undefined}
+                  stopping={stopping}
+                />
+              )}
+              {pendingPause && canBuild && (planHasSteps ? (
+                <PlanSummaryCard pause={pendingPause} open={planOpen} onOpen={() => setHiddenPlan(null)} />
+              ) : (
+                <PauseCard key={pendingPause.pauseId} projectId={id} pause={pendingPause} onError={showError} />
+              ))}
               {unsaved && !running && canBuild && (
                 <div className="space-y-2 rounded-[10px] border border-warn/40 bg-warn-weak p-3">
                   <p className="font-semibold">These changes are not saved yet</p>
@@ -1027,7 +1208,45 @@ export function ProjectView() {
               </p>
             </div>
           ) : (
-          <form onSubmit={send} className="flex shrink-0 flex-col gap-2 border-t border-line p-3">
+          <form
+            onSubmit={send}
+            // @container: the controls row tightens when the chat column is narrow.
+            className={`@container relative flex shrink-0 flex-col gap-2 border-t border-line p-3 ${dragging ? "bg-primary-weak/40" : ""}`}
+            onDragOver={(e) => {
+              if (!canBuild || !e.dataTransfer.types.includes("Files")) return;
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false);
+            }}
+            onDrop={(e) => {
+              if (!e.dataTransfer.files.length) return;
+              e.preventDefault();
+              setDragging(false);
+              void attach(e.dataTransfer.files);
+            }}
+          >
+            {queue.length > 0 && (
+              <QueueList
+                items={queue}
+                running={running}
+                canEdit={canBuild}
+                onRemove={(qid) => {
+                  setQueue((q) => q.filter((x) => x.id !== qid));
+                  api.removeQueued(id, qid).catch((err) => {
+                    setError(errText(err));
+                    void refreshQueue();
+                  });
+                }}
+                onRunNext={() => api.runNextQueued(id).catch((err) => setError(errText(err)))}
+              />
+            )}
+            {dragging && (
+              <div className="pointer-events-none absolute inset-2 z-10 grid place-items-center rounded-[10px] border-2 border-dashed border-primary bg-surface/80 text-[13px] font-semibold text-primary">
+                Drop files to attach them
+              </div>
+            )}
             {error && (
               <p className="text-xs text-danger" role="alert">
                 {error}
@@ -1062,7 +1281,7 @@ export function ProjectView() {
               <div className="flex flex-wrap gap-1.5">
                 {attachments.map((a) => (
                   <span key={a.path} className="pill gap-1.5 bg-surface-2 py-1 pr-1">
-                    {a.type.startsWith("image/") ? <ImageIcon size={13} aria-hidden /> : <Paperclip size={13} aria-hidden />}
+                    <AttachmentIcon name={a.name} type={a.type} />
                     <span className="max-w-40 truncate">{a.name}</span>
                     <button
                       type="button"
@@ -1125,7 +1344,7 @@ export function ProjectView() {
                 pendingPause
                   ? "Answer the agent above to continue"
                   : running
-                    ? "The agent is working…"
+                    ? "Keep going: your message waits in the queue until the agent is done…"
                     : mode === "chat"
                       ? "Ask anything about this app…"
                       : mode === "plan"
@@ -1134,10 +1353,10 @@ export function ProjectView() {
                           ? "Paste a Figma frame link or a screenshot, and say where it goes…"
                         : "Ask for a change… (@ to add a page or file)"
               }
-              disabled={running}
+              disabled={Boolean(pendingPause)}
               className="in min-h-20 resize-none disabled:opacity-60"
             />
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 @max-[28rem]:gap-1.5">
               <ComposerMenu
                 open={menu.open}
                 onOpenChange={(o) => setMenu((m) => ({ ...m, open: o, startIn: o ? m.startIn : "root" }))}
@@ -1160,24 +1379,43 @@ export function ProjectView() {
               />
               {uploading && <span className="lab">Attaching…</span>}
               <span className="ml-auto" />
-              <ModeSelect mode={mode} onChange={setMode} />
-              {running ? (
-                <button type="button" onClick={() => api.cancelRun(id).catch((e) => setError(errText(e)))} className="btn btn-sm">
-                  Stop
-                </button>
-              ) : (
-                <button type="submit" disabled={!prompt.trim() || sending || uploading} className="btn btn-p btn-sm">
-                  {sending ? <Spinner size={13} /> : <SendHorizontal size={14} aria-hidden />}
-                  {sending ? "Sending…" : mode === "chat" ? "Ask" : "Send"}
+              {models && effectiveModelKey && <ModelPicker data={models} value={effectiveModelKey} onChange={setModelKey} mode={mode} />}
+              {canBuild && (
+                <AutoToggle on={Boolean(project?.autonomous)} mode={mode} onChange={setAutonomous} />
+              )}
+              <ModeSelect mode={mode} onChange={setMode} autonomous={Boolean(project?.autonomous)} onAutonomous={canBuild ? setAutonomous : undefined} />
+              {running && (
+                <button type="button" onClick={stopRun} disabled={stopping} className="btn btn-sm" title="Stop the agent (queued messages wait)">
+                  {stopping ? <Spinner size={13} /> : <Square size={11} className="fill-current" aria-hidden />}
+                  {stopping ? "Stopping…" : "Stop"}
                 </button>
               )}
+              <button
+                type="submit"
+                disabled={!prompt.trim() || sending || uploading || Boolean(pendingPause)}
+                className="btn btn-p btn-sm"
+                title={running ? "Runs when the agent is done" : undefined}
+              >
+                {sending ? <Spinner size={13} /> : running ? <ListPlus size={14} aria-hidden /> : <SendHorizontal size={14} aria-hidden />}
+                {sending ? "Sending…" : running ? "Queue" : mode === "chat" ? "Ask" : "Send"}
+              </button>
             </div>
           </form>
           )}
         </section>
 
         {/* Preview */}
-        <section aria-label="Preview" className="flex min-h-[50vh] min-w-0 flex-1 flex-col">
+        <section aria-label="Preview" className="relative flex min-h-[50vh] min-w-0 flex-1 flex-col">
+          {canBuild && <SharePreviewModal projectId={id} open={sharing} onClose={() => setSharing(false)} />}
+          {planOpen && pendingPause && (
+            <PlanPanel
+              key={pendingPause.pauseId}
+              projectId={id}
+              pause={pendingPause}
+              onClose={() => setHiddenPlan(pendingPause.pauseId)}
+              onError={showError}
+            />
+          )}
           <div className="flex shrink-0 flex-wrap items-end gap-2 bg-surface px-3 pt-1.5">
             <div className="seg mb-1" role="tablist" aria-label="View">
               <button role="tab" aria-selected={view === "preview"} className="mode" onClick={() => setView("preview")}>
@@ -1248,7 +1486,20 @@ export function ProjectView() {
                 )}
                 <MoreMenu
                   toolbarHidden={toolbarPrefs.placement === "hide"}
-                  previewUrl={sandbox.previewUrl + currentPath}
+                  onOpenInTab={() => {
+                    // A new tab is a different context: open it through its own entry link.
+                    const w = window.open("about:blank", "_blank");
+                    api.previewAccess(id, { next: currentPath }).then(
+                      (r) => {
+                        if (w) w.location.href = r.url;
+                      },
+                      (e) => {
+                        w?.close();
+                        setError(errText(e));
+                      },
+                    );
+                  }}
+                  onShare={canBuild ? () => setSharing(true) : undefined}
                   downloadUrl={api.downloadUrl(id, project?.name ?? id)}
                   canBuild={canBuild}
                   onHardReload={() => {
@@ -1330,10 +1581,11 @@ export function ProjectView() {
                 }
               >
                 {drawing && <DrawLayer strokes={strokes} onStrokes={setStrokes} scale={splitId ? 1 : frameScale} />}
+                {preview.state === "down" && <PreviewOffline onRetry={preview.retry} />}
                 <iframe
                   ref={iframeRef}
-                  key={previewKey}
-                  src={sandbox.previewUrl}
+                  key={`${previewKey}:${accessEpoch}`}
+                  src={previewEntry ?? undefined}
                   title="App preview"
                   className={`h-full w-full border-0 ${resizing || frameResizing ? "pointer-events-none" : ""}`}
                 />
@@ -1390,7 +1642,7 @@ export function ProjectView() {
                     </div>
                     <iframe
                       ref={splitRef}
-                      key={`split-${splitId}-${previewKey}`}
+                      key={`split-${splitId}-${previewKey}-${accessEpoch}`}
                       src={sandbox.previewUrl + st.path}
                       title="Split view of the app"
                       className={`min-h-0 w-full flex-1 border-0 ${resizing ? "pointer-events-none" : ""}`}
@@ -1423,26 +1675,28 @@ export function ProjectView() {
 /** "More" in the preview toolbar: open, copy link, download code, reload, restart the app server. */
 function MoreMenu({
   toolbarHidden,
-  previewUrl,
+  onOpenInTab,
+  onShare,
   downloadUrl,
   canBuild,
   onHardReload,
   onRestart,
 }: {
   toolbarHidden: boolean;
-  previewUrl: string;
+  onOpenInTab: () => void;
+  /** Share links for people outside Forge (builders). */
+  onShare?: () => void;
   downloadUrl: string;
   canBuild: boolean;
   onHardReload: () => void;
   onRestart: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);
     document.addEventListener("mousedown", close);
@@ -1466,22 +1720,16 @@ function MoreMenu({
               Show the review toolbar
             </button>
           )}
-          <a className={item} href={previewUrl} target="_blank" rel="noreferrer" onClick={() => setOpen(false)}>
+          <button type="button" className={item} onClick={() => (onOpenInTab(), setOpen(false))}>
             <ExternalLink size={15} aria-hidden />
             Open in a new tab
-          </a>
-          <button
-            type="button"
-            className={item}
-            onClick={async () => {
-              await navigator.clipboard.writeText(previewUrl).catch(() => undefined);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            }}
-          >
-            <Link2 size={15} aria-hidden />
-            {copied ? "Copied" : "Copy preview link"}
           </button>
+          {onShare && (
+            <button type="button" className={item} onClick={() => (onShare(), setOpen(false))}>
+              <Link2 size={15} aria-hidden />
+              Share preview link…
+            </button>
+          )}
           <a className={item} href={downloadUrl} onClick={() => setOpen(false)}>
             <Download size={15} aria-hidden />
             Download code (.zip)
@@ -1503,15 +1751,39 @@ function MoreMenu({
 }
 
 /** The project name button; opens a list of the team's projects (Flowkite's app switcher). */
-function ProjectSwitcher({ projectId, name }: { projectId: string; name: string }) {
+function ProjectSwitcher({ projectId, name, onRename }: { projectId: string; name: string; onRename?: (name: string) => Promise<void> }) {
   const [open, setOpen] = useState(false);
+  // Renaming happens in place at the top of this menu (builders and admins).
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(name);
+  const [saving, setSaving] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const startRename = () => {
+    setDraft(name);
+    setRenameError(null);
+    setRenaming(true);
+  };
+  const saveRename = async () => {
+    const next = draft.trim();
+    if (!onRename || !next || next === name) return setRenaming(false);
+    setSaving(true);
+    setRenameError(null);
+    try {
+      await onRename(next);
+      setRenaming(false);
+    } catch (e) {
+      setRenameError(errText(e));
+    } finally {
+      setSaving(false);
+    }
+  };
   const [projects, setProjects] = useState<Project[] | null>(null);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
     api.listProjects().then(setProjects, () => undefined);
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     // Clicks inside the preview iframe never reach this document; the window losing focus to it does.
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);
@@ -1526,9 +1798,18 @@ function ProjectSwitcher({ projectId, name }: { projectId: string; name: string 
     <div ref={box} className="relative">
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setOpen((o) => !o);
+          setRenaming(false);
+        }}
+        onDoubleClick={() => {
+          if (!onRename) return;
+          setOpen(true);
+          startRename();
+        }}
+        title={onRename ? "Switch project (double-click to rename)" : "Switch project"}
         aria-expanded={open}
-        aria-label={`Project: ${name}. Switch project`}
+        aria-label={`Project: ${name}. Switch or rename project`}
         className="flex h-9 items-center gap-2 rounded-lg border border-line-2 bg-surface pl-1 pr-2.5 font-semibold"
       >
         <ProjectBadge id={projectId} name={name} />
@@ -1537,6 +1818,56 @@ function ProjectSwitcher({ projectId, name }: { projectId: string; name: string 
       </button>
       {open && (
         <div className="pop absolute left-0 top-11 z-30 flex w-80 flex-col gap-2 p-3">
+          <div className="flex items-center gap-2.5 border-b border-line pb-2.5">
+            <ProjectBadge id={projectId} name={renaming ? draft || name : name} size={32} />
+            {renaming ? (
+              <form
+                className="flex min-w-0 flex-1 items-center gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void saveRename();
+                }}
+              >
+                <input
+                  autoFocus
+                  value={draft}
+                  maxLength={80}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.stopPropagation();
+                      setRenaming(false);
+                    }
+                  }}
+                  onFocus={(e) => e.currentTarget.select()}
+                  aria-label="Project name"
+                  className="in h-8 min-w-0 flex-1 text-[13.5px] font-semibold"
+                  disabled={saving}
+                />
+                <button type="submit" className="btn btn-p btn-sm btn-icon" aria-label="Save name" disabled={saving || !draft.trim()}>
+                  {saving ? <Spinner size={13} /> : <Check size={14} aria-hidden />}
+                </button>
+                <button type="button" className="btn btn-g btn-sm btn-icon" aria-label="Cancel" onClick={() => setRenaming(false)} disabled={saving}>
+                  <X size={14} aria-hidden />
+                </button>
+              </form>
+            ) : (
+              <>
+                <span className="min-w-0 flex-1 truncate font-semibold">{name}</span>
+                {onRename && (
+                  <button type="button" className="btn btn-g btn-sm" onClick={startRename}>
+                    <Pencil size={13} aria-hidden />
+                    Rename
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+          {renameError && (
+            <p className="text-[12.5px] text-danger" role="alert">
+              {renameError}
+            </p>
+          )}
           <span className="lab">Team projects</span>
           <div className="grid max-h-80 grid-cols-2 gap-2 overflow-y-auto">
             {(projects ?? []).map((p) => (
@@ -1571,7 +1902,7 @@ function EventLine({ icon, tone = "muted", children }: { icon: React.ReactNode; 
   );
 }
 
-function FeedItem({ item }: { item: Item }) {
+function FeedItem({ item, projectId }: { item: Item; projectId: string }) {
   switch (item.kind) {
     case "prompt":
       if (item.e.mode === "qa") {
@@ -1593,12 +1924,21 @@ function FeedItem({ item }: { item: Item }) {
             {(context || attached.length > 0) && (
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {context && <span className="pill bg-surface font-mono">{context}</span>}
-                {attached.map((f) => (
-                  <span key={f} className="pill bg-surface">
-                    <Paperclip size={12} aria-hidden />
-                    {f.replace(/^.*\/[a-z0-9]+-/, "")}
-                  </span>
-                ))}
+                {attached.map((f) => {
+                  // Office files are attached as their text copy (<name>.docx.md): show the original name.
+                  const name = f.replace(/^.*\/[a-z0-9]+-/, "").replace(/\.(docx|xlsx|pptx)\.md$/, ".$1");
+                  return isImagePath(f) ? (
+                    <span key={f} className="flex max-w-[14rem] items-center gap-2 rounded-lg bg-surface p-1 pr-2.5 text-[12px]">
+                      <AttachmentThumb projectId={projectId} path={f} name={name} size={36} />
+                      <span className="truncate">{name}</span>
+                    </span>
+                  ) : (
+                    <span key={f} className="pill bg-surface">
+                      <AttachmentIcon name={name} size={12} />
+                      {name}
+                    </span>
+                  );
+                })}
               </div>
             )}
             <p className="lab mt-1 flex items-center gap-1.5">
@@ -1617,6 +1957,9 @@ function FeedItem({ item }: { item: Item }) {
       const isAttachment = call.tool === "Read" && upload;
       const label = isAttachment ? "Viewed" : (TOOL_LABELS[call.tool] ?? call.tool.replace(/^mcp__[^_]+__/, ""));
       const summary = isAttachment ? `attachment · ${upload[1]}` : call.summary;
+      // The attached image itself, when the agent looked at one: shown instead of "[image]".
+      const inputPath = String((call.input as { file_path?: unknown } | null)?.file_path ?? "").replace(/^\/workspace\//, "");
+      const imagePath = isAttachment ? [inputPath, call.summary ?? ""].find(isImagePath) : undefined;
       return (
         <details className="group rounded-md px-2 py-1 hover:bg-surface-2 open:bg-surface-2">
           <summary className="flex cursor-pointer list-none items-center gap-2 text-[13px]">
@@ -1628,10 +1971,13 @@ function FeedItem({ item }: { item: Item }) {
               <XCircle size={14} className="shrink-0 text-danger" aria-label="Failed" />
             )}
             <span className="shrink-0 font-semibold">{label}</span>
+            {imagePath && <AttachmentThumb projectId={projectId} path={imagePath} name={upload![1]!} size={22} className="rounded" />}
             <span className="truncate text-ink-2">{summary}</span>
             <ChevronRight size={14} className="ml-auto shrink-0 text-ink-3 transition-transform group-open:rotate-90" aria-hidden />
           </summary>
-          {result && (
+          {result && imagePath && result.ok ? (
+            <AttachmentPreview projectId={projectId} path={imagePath} name={upload![1]!} />
+          ) : result && (
             <pre className="mt-1.5 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-surface p-2 font-mono text-[11px] text-ink-2">
               {result.output || "(no output)"}
             </pre>
@@ -1777,7 +2123,14 @@ function FeedItem({ item }: { item: Item }) {
     }
     case "usage":
       return (
-        <p className="font-mono text-[11px] text-ink-3">
+        <p className="flex flex-wrap items-center gap-x-1.5 font-mono text-[11px] text-ink-3">
+          {item.model && (
+            <span className="flex items-center gap-1 font-sans font-medium text-ink-2" title="The model that answered">
+              <Sparkles size={11} aria-hidden />
+              {item.model}
+              <span className="text-ink-3">·</span>
+            </span>
+          )}
           {Math.round((item.e.inputTokens + item.e.cacheReadTokens) / 1000)}k in · {Math.round(item.e.outputTokens / 1000)}k out · $
           {item.e.costUsd.toFixed(2)}
         </p>
@@ -1788,7 +2141,7 @@ function FeedItem({ item }: { item: Item }) {
         <EventLine icon={<CircleStop size={15} aria-hidden />}>Stopped.</EventLine>
       ) : (
         <EventLine icon={<XCircle size={15} aria-hidden />} tone="bad">
-          Run failed: {item.e.error ?? "unknown error"}
+          <span className="font-semibold">The request didn&apos;t finish.</span> <LinkedText text={cleanRunError(item.e.error)} />
         </EventLine>
       );
   }
@@ -1967,6 +2320,7 @@ const TOOL_LABELS: Record<string, string> = {
   mcp__forge__save_to_library: "Saved to library",
   mcp__forge__ask_user: "Asked you",
   mcp__forge__present_plan: "Shared a plan",
+  mcp__forge__look_at_page: "Looked at the page",
   mcp__browser__open: "Browser",
   mcp__browser__click: "Browser",
   mcp__browser__fill: "Browser",
@@ -2072,19 +2426,21 @@ function AutoQaSwitch({
   );
 }
 
-/** Splits off the "(Attached files…)" line that send() adds; returns the rest and the file paths. */
-function splitAttachments(prompt: string): [string, string[]] {
-  const m = /\n\n\(Attached files, open them with the Read tool: ([^)]*)\)$/.exec(prompt);
-  if (!m) return [prompt, []];
-  return [prompt.slice(0, m.index), m[1]!.split(", ").filter(Boolean)];
-}
 
-/** Splits a prompt into the user's words and a short label for the element picked in the preview. */
-function splitElementContext(prompt: string): [string, string | null] {
-  const i = prompt.indexOf("\n\n(Selected in the preview on ");
-  if (i < 0) return [prompt, null];
-  const head = prompt.slice(i + 2).split("\n")[0] ?? "";
-  const m = /a <(\w+)>(?: showing "([^"]*)")?(?:, in the "([^"]*)" section)?/.exec(head);
-  const label = m ? `<${m[1]}>${m[2] ? ` "${m[2].slice(0, 40)}"` : ""}${m[3] ? ` in ${m[3]}` : ""}` : "an element";
-  return [prompt.slice(0, i), `Selected: ${label}`];
+/** Text with its web addresses as links (e.g. a provider's billing page in an error). */
+function LinkedText({ text }: { text: string }) {
+  const parts = text.split(/(https?:\/\/[^\s]+?)(?=[.,;:)]?(?:\s|$))/g);
+  return (
+    <>
+      {parts.map((p, i) =>
+        /^https?:\/\//.test(p) ? (
+          <a key={i} href={p} target="_blank" rel="noreferrer" className="break-all underline underline-offset-2 hover:opacity-80">
+            {p.replace(/^https?:\/\//, "").replace(/\/$/, "")}
+          </a>
+        ) : (
+          <span key={i}>{p}</span>
+        ),
+      )}
+    </>
+  );
 }

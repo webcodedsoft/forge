@@ -93,6 +93,12 @@ export const project = pgTable(
     templateId: text("template_id"),
     /** Run the QA agent automatically after each saved version. */
     autoQa: boolean("auto_qa").default(false).notNull(),
+    /** Build without stopping for plan approval or questions (Build and Design; Plan mode still asks). */
+    autonomous: boolean("autonomous").default(false).notNull(),
+    /** The name was derived from the first request; Forge may replace it with a better suggestion. */
+    nameAuto: boolean("name_auto").default(false).notNull(),
+    /** The model picked last in the prompt box ("provider:model"); null: the workspace default. */
+    lastModel: text("last_model"),
     /** Daily spend limit for automatic QA runs in this project, in US cents. */
     autoQaDailyBudgetCents: integer("auto_qa_daily_budget_cents").default(200).notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -443,4 +449,54 @@ export const projectDataSource = pgTable(
       .references(() => dataSource.id, { onDelete: "cascade" }),
   },
   (t) => [uniqueIndex("project_data_source_pk").on(t.projectId, t.sourceId)],
+);
+
+/* ------------------------------ message queue ------------------------------ */
+
+/**
+ * Requests sent while the agent is busy (queue.ts). They run one at a time, oldest first, when
+ * the current run ends.
+ */
+export const queuedMessage = pgTable(
+  "queued_message",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => project.id, { onDelete: "cascade" }),
+    prompt: text("prompt").notNull(),
+    /** RunMode: build, chat, plan, design. */
+    mode: text("mode").default("build").notNull(),
+    /** "provider:model" picked when it was sent; null: the default. */
+    model: text("model"),
+    userId: text("user_id").notNull(),
+    userName: text("user_name").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [index("queued_message_project_idx").on(t.projectId, t.createdAt)],
+);
+
+/* ---------------------------- preview share links --------------------------- */
+
+/**
+ * Links that let anyone view one project's preview until they expire (preview-access.ts). Only a
+ * hash of the token is stored, so the database can't be used to open previews.
+ */
+export const previewShare = pgTable(
+  "preview_share",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => project.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull(),
+    label: text("label"),
+    createdBy: text("created_by").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    revokedAt: timestamp("revoked_at"),
+    lastUsedAt: timestamp("last_used_at"),
+    uses: integer("uses").default(0).notNull(),
+  },
+  (t) => [index("preview_share_project_idx").on(t.projectId), uniqueIndex("preview_share_token_idx").on(t.tokenHash)],
 );

@@ -22,6 +22,17 @@ This app is built by the Forge agent for our team. It runs in a sandbox containe
 - Never commit secrets. Configuration that needs secrets reads from environment variables.
 - Do not run `git commit`, `git push` or rewrite history; Forge commits your work after each run.
 
+## Project structure
+
+Keep code organised so teammates (and the agent) can find and reuse things:
+
+- `src/app/` routes: pages and layouts compose components and pass data; no large blocks of UI or logic inline.
+- `src/components/` reusable UI (one component per file, typed props); `src/components/ui/` small primitives (Button, Card, Badge, EmptyState).
+- `src/lib/` data access, API calls, mapping, formatting, validation and business logic (no JSX).
+- `src/hooks/` client hooks (`useSomething`), e.g. data loading or UI state shared by several components.
+- `src/types/` shared types (or a `types.ts` next to the feature).
+- Extract a component when UI repeats or a file passes ~200 lines; don't create wrappers or helpers that are used once.
+
 ## Our API (data)
 
 Apps get their data from our in-house REST API, never from a local database.

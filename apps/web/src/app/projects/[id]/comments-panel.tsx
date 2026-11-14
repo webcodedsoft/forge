@@ -1,5 +1,6 @@
 "use client";
 
+import { TriangleAlert } from "lucide-react";
 import type { CommentAnchor, PresenceUser, ProjectComment } from "@forge/protocol";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BusyLabel } from "@/components/loading";
@@ -28,9 +29,12 @@ export function CommentsPanel({
   onDraftDone,
   onAskAgent,
   onError,
+  missingPins,
 }: {
   projectId: string;
   threads: Thread[];
+  /** Comments whose spot the preview can't find on the page it shows (the page changed since). */
+  missingPins?: Set<string>;
   meId: string | undefined;
   activeId: string | null;
   onActivate: (id: string | null) => void;
@@ -72,6 +76,7 @@ export function CommentsPanel({
           onActivate={() => onActivate(t.id === activeId ? null : t.id)}
           onAskAgent={onAskAgent ? () => onAskAgent(t) : undefined}
           onError={onError}
+          pinMissing={missingPins?.has(t.id)}
         />
       ))}
       <Pagination pager={pager} noun="comments" compact />
@@ -152,6 +157,7 @@ function ThreadCard({
   onActivate,
   onAskAgent,
   onError,
+  pinMissing,
 }: {
   projectId: string;
   thread: Thread;
@@ -160,6 +166,7 @@ function ThreadCard({
   onActivate: () => void;
   onAskAgent?: () => void;
   onError: (msg: string) => void;
+  pinMissing?: boolean;
 }) {
   const [reply, setReply] = useState("");
   const [busy, setBusy] = useState(false);
@@ -194,6 +201,12 @@ function ThreadCard({
         </span>
         {thread.resolved && <span className="pill pill-ok">Resolved</span>}
       </button>
+      {pinMissing && !thread.resolved && (
+        <p className="mt-1.5 flex items-start gap-1.5 rounded-md bg-warn-weak px-2 py-1.5 text-[12px] text-ink-2">
+          <TriangleAlert size={13} className="mt-0.5 shrink-0 text-warn" aria-hidden />
+          The page changed since this comment, so its pin can&apos;t be placed. The comment is kept.
+        </p>
+      )}
 
       {[thread, ...thread.replies].map((c) => (
         <div key={c.id} className="mt-2">

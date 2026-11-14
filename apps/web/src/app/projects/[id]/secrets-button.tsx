@@ -37,7 +37,7 @@ export function SecretsButton({
   useEffect(() => {
     if (!open) return;
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     // Clicks inside the preview iframe never reach this document; the window losing focus to it does.
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);

@@ -31,7 +31,7 @@ export function ApisPicker({ projectId, disabled, onError }: { projectId: string
     api.connections().then(setApis, (e) => onError(e.message));
     api.dataSources().then(setSources, (e) => onError(e.message));
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     // Clicks inside the preview iframe never reach this document; the window losing focus to it does.
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);

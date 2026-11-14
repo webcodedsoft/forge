@@ -116,25 +116,61 @@ const forgeTools = createSdkMcpServer({
     ),
     tool(
       "present_plan",
-      "Show the user a short implementation plan in Markdown and wait for approval before building. Use it before " +
-        "building a new app or making a large change (new pages, data model, auth). Not needed for small edits.",
+      "Show the user a plan and wait for approval before building. Use it before building a new app or making a " +
+        "large change (new pages, data model, auth); not for small edits. Never write a plan as a chat message and " +
+        "ask whether to proceed: use this tool. The user can untick, edit and add steps, and leave a note.",
       {
-        title: z.string(),
-        plan: z.string().describe("Markdown: what the user will get, then the main technical steps. Keep it brief."),
+        title: z.string().describe("Short name of what will be built"),
+        summary: z.string().describe("Markdown, 1-3 sentences: what the user gets."),
+        steps: z
+          .array(
+            z.object({
+              title: z.string().describe("One concrete step, in plain words (what changes for the user)."),
+              detail: z.string().optional().describe("Optional: how, in one or two sentences."),
+              optional: z.boolean().optional().describe("True for nice-to-haves the user may skip."),
+            }),
+          )
+          .min(1)
+          .max(30),
       },
-      async ({ title, plan }) => {
-        const r = await pauseForUser("plan", { title, plan });
+      async ({ title, summary, steps }) => {
+        const withIds = steps.map((st, i) => ({ id: `s${i + 1}`, ...st }));
+        const plan = [summary, "", ...withIds.map((st, i) => `${i + 1}. **${st.title}**${st.detail ? ` — ${st.detail}` : ""}${st.optional ? " _(optional)_" : ""}`)].join("\n");
+        const r = await pauseForUser("plan", { title, summary, steps: withIds, plan });
         if (!r.answered) return text("The user did not respond to the plan. Do not build; summarize the plan and stop.");
-        const { decision, feedback, plan: edited } = r.answer ?? {};
+        const { decision, feedback, steps: kept, removed, plan: edited } = r.answer ?? {};
+        const list = (kept ?? [])
+          .map((st, i) => `${i + 1}. ${st.title}${st.detail ? ` — ${st.detail}` : ""}${st.origin === "user" ? " (added by the user)" : st.edited ? " (edited by the user)" : ""}`)
+          .join("\n");
+        const extras = [
+          removed?.length ? `The user removed these steps; do not do them:\n${removed.map((t) => `- ${t}`).join("\n")}` : "",
+          feedback ? `The user's note:\n${feedback}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
         if (decision === "approve") {
-          return text(
-            edited && edited !== plan
-              ? `The user approved an edited plan. Build exactly this:\n\n${edited}`
-              : "The user approved the plan. Build it now.",
-          );
+          const go =
+            "Implement ALL of these steps now, one after another, in this turn. Do not stop between steps or phases to ask " +
+            "for permission or confirmation: the approval covers the whole plan. Only ask if you are truly blocked.";
+          if (list) return text(`The user approved this plan. Build exactly these steps, in this order, and nothing they removed:\n${list}${extras ? `\n\n${extras}` : ""}\n\n${go}`);
+          return text(`${edited && edited !== plan ? `The user approved an edited plan. Build exactly this:\n\n${edited}` : "The user approved the plan."}\n\n${go}`);
         }
-        return text(`The user wants changes to the plan before you build:\n${feedback || "(no details)"}\nRevise the plan and present it again.`);
+        return text(
+          `The user wants changes to the plan before you build.${list ? `\nTheir version of the steps:\n${list}` : ""}${extras ? `\n\n${extras}` : ""}\nRevise the plan and present it again with present_plan.`,
+        );
       },
+    ),
+    tool(
+      "look_at_page",
+      "See the app as the user will: screenshots of a page of the running app (desktop and/or phone width) plus " +
+        "any browser errors. Use it after building or changing UI, to compare the result with the request and any " +
+        "attached design, then fix what doesn't match. The dev server must already be serving the page.",
+      {
+        path: z.string().describe("App path, e.g. / or /settings"),
+        viewports: z.array(z.enum(["desktop", "phone"])).min(1).max(2).default(["desktop", "phone"]),
+        fullPage: z.boolean().default(true).describe("Capture the whole page (up to ~2400px tall), not just the first screen"),
+      },
+      async ({ path, viewports, fullPage }) => lookAtPage(path, viewports, fullPage),
     ),
     tool(
       "save_to_library",
@@ -165,12 +201,55 @@ const forgeTools = createSdkMcpServer({
   ],
 });
 
+/* ------------------------- look_at_page (build agent) ------------------------- */
+// A short-lived browser of its own (not the QA agent's live-streamed one).
+async function lookAtPage(path, viewports, fullPage) {
+  const { chromium } = await import("playwright-core");
+  const { readdirSync } = await import("node:fs");
+  const dir = readdirSync("/ms-playwright").find((d) => /^chromium-\d+$/.test(d));
+  const arch = readdirSync(`/ms-playwright/${dir}`).find((d) => d.startsWith("chrome-linux"));
+  const b = await chromium.launch({ executablePath: `/ms-playwright/${dir}/${arch}/chrome`, args: ["--no-sandbox"] });
+  const sizes = { desktop: { width: 1280, height: 800 }, phone: { width: 390, height: 844 } };
+  const content = [];
+  try {
+    for (const v of viewports) {
+      const page = await b.newPage({ viewport: sizes[v], deviceScaleFactor: 1 });
+      const errors = [];
+      page.on("console", (m) => m.type() === "error" && errors.push(m.text().slice(0, 300)));
+      page.on("pageerror", (e) => errors.push(`Uncaught: ${String(e.message).slice(0, 300)}`));
+      const url = "http://localhost:3000" + (path.startsWith("/") ? path : `/${path}`);
+      const res = await page.goto(url, { waitUntil: "load", timeout: 120_000 }).catch((e) => ({ status: () => `failed (${e.message.split("\n")[0]})` }));
+      await page.waitForTimeout(900);
+      const height = fullPage ? Math.min(2400, await page.evaluate(() => document.documentElement.scrollHeight).catch(() => sizes[v].height)) : sizes[v].height;
+      const shot = await page.screenshot({
+        type: "jpeg",
+        quality: 72,
+        fullPage,
+        clip: { x: 0, y: 0, width: sizes[v].width, height: Math.max(height, sizes[v].height) },
+      });
+      content.push({
+        type: "text",
+        text:
+          `${v} (${sizes[v].width}px wide) · HTTP ${typeof res?.status === "function" ? res.status() : "?"}${errors.length ? `\nBrowser errors:\n- ${errors.slice(0, 8).join("\n- ")}` : " · no browser errors"}` +
+          (v === viewports[0] ? "\n(The round \"N\" button in a bottom corner is Next.js's dev indicator, not part of the app.)" : ""),
+      });
+      content.push({ type: "image", data: shot.toString("base64"), mimeType: "image/jpeg" });
+      await page.close();
+    }
+  } finally {
+    await b.close().catch(() => undefined);
+  }
+  return { content };
+}
+
 /* ------------------------------ QA mode tools ------------------------------ */
 // A real browser the QA agent drives, kept open for the whole session.
 
 const QA = input.mode === "qa";
 // Chat mode: answer and explore with read-only tools; no edits, no commands.
 const READ_ONLY = Boolean(input.readOnly);
+// Autonomous projects: no plan approval or questions; the agent decides and keeps going.
+const AUTONOMOUS = Boolean(input.autonomous);
 const APP_URL = "http://localhost:3000";
 let browser = null;
 let page = null;
@@ -374,14 +453,16 @@ try {
         ? ["Read", "Glob", "Grep", "TodoWrite", ...["open", "snapshot", "click", "fill", "press", "screenshot", "report_issue", "propose_test"].map((n) => `mcp__browser__${n}`)]
         : [
             "Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite", "WebFetch", "WebSearch",
-            "mcp__forge__ask_user", "mcp__forge__present_plan", "mcp__forge__save_to_library",
+            "mcp__forge__ask_user", "mcp__forge__present_plan", "mcp__forge__save_to_library", "mcp__forge__look_at_page",
           ],
       // The QA agent tests; it never changes the app.
       disallowedTools: QA
         ? ["Write", "Edit", "Bash", "NotebookEdit", "WebFetch", "WebSearch"]
         : READ_ONLY
           ? ["Write", "Edit", "Bash", "NotebookEdit", "mcp__forge__save_to_library", "mcp__forge__present_plan"]
-          : undefined,
+          : AUTONOMOUS
+            ? ["mcp__forge__present_plan", "mcp__forge__ask_user"]
+            : undefined,
       // Load the project's CLAUDE.md (which imports AGENTS.md).
       settingSources: ["project"],
       systemPrompt: { type: "preset", preset: "claude_code", append: input.appendSystemPrompt ?? "" },

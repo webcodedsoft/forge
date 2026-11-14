@@ -5,6 +5,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Contrast,
   EyeOff,
   Keyboard,
@@ -125,7 +126,7 @@ export function ReviewToolbar({
   useEffect(() => {
     if (!menu) return;
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setMenu(false);
+      if (box.current && !e.composedPath().includes(box.current)) setMenu(false);
     };
     const key = (e: KeyboardEvent) => e.key === "Escape" && setMenu(false);
     document.addEventListener("mousedown", close);
@@ -136,7 +137,21 @@ export function ReviewToolbar({
     };
   }, [menu]);
 
-  if (prefs.placement === "hide") return null;
+  // Hidden: tucked into a slim tab docked at the bottom edge; one click brings the toolbar back.
+  if (prefs.placement === "hide") {
+    return (
+      <button
+        type="button"
+        onClick={() => setToolbarPrefs({ placement: "dock" })}
+        className="group absolute bottom-0 left-1/2 z-20 flex h-6 -translate-x-1/2 items-center gap-1 rounded-t-lg border border-b-0 border-line bg-surface/90 px-3 text-[11.5px] font-medium text-ink-3 shadow-sm backdrop-blur transition-colors hover:h-7 hover:text-ink"
+        aria-label="Show the review toolbar"
+        title="Show the review toolbar"
+      >
+        <ChevronUp size={13} className="transition-transform group-hover:-translate-y-px" aria-hidden />
+        Tools
+      </button>
+    );
+  }
   const tools = TOOLS.filter((t) => canBuild || t.id === "comment");
 
   if (prefs.placement === "minimize") {
@@ -163,7 +178,7 @@ export function ReviewToolbar({
             [
               ["dock", "Dock", PanelBottom],
               ["minimize", "Minimize", Minimize2],
-              ["hide", "Hide", EyeOff],
+              ["hide", "Hide (tab at the bottom)", EyeOff],
             ] as const
           ).map(([id, label, Icon]) => (
             <button

@@ -1,6 +1,8 @@
 "use client";
 
 import type { ApiAuthInput, ApiAuthKind, ApiAuthSummary } from "@forge/protocol";
+import { Building2, KeyRound, LogIn, ShieldCheck, Ticket, Unlock, UserRound } from "lucide-react";
+import { Select } from "@/components/select";
 
 /** Sign-in choices for an API, with plain descriptions. */
 export const AUTH_KINDS: { id: ApiAuthKind; label: string; help: string }[] = [
@@ -12,6 +14,16 @@ export const AUTH_KINDS: { id: ApiAuthKind; label: string; help: string }[] = [
   { id: "oauth2_client", label: "OAuth 2 (client credentials)", help: "Forge gets a token from your token URL and renews it." },
   { id: "entra_user", label: "Signed-in user (Entra)", help: "Calls run as the person using the app (company sign-in)." },
 ];
+
+const AUTH_ICONS: Record<ApiAuthKind, React.ReactNode> = {
+  none: <Unlock size={14} />,
+  api_key: <KeyRound size={14} />,
+  bearer: <Ticket size={14} />,
+  basic: <UserRound size={14} />,
+  login: <LogIn size={14} />,
+  oauth2_client: <ShieldCheck size={14} />,
+  entra_user: <Building2 size={14} />,
+};
 
 /** Form state for every kind at once, so switching kinds doesn't lose what was typed. */
 export type AuthDraft = {
@@ -149,27 +161,30 @@ export function AuthFields({ draft, onChange, editing = false }: { draft: AuthDr
   const secretHint = editing ? "Enter it again to change it; it isn't shown once saved." : "Stored encrypted. Apps and the agent never see it.";
   return (
     <div className="flex flex-col gap-3">
-      <label className="flex flex-col gap-1.5">
+      <div className="flex flex-col gap-1.5">
         <span className="lab">Sign-in</span>
-        <select className="in" value={draft.kind} onChange={(e) => set({ kind: e.target.value as ApiAuthKind })}>
-          {AUTH_KINDS.map((k) => (
-            <option key={k.id} value={k.id}>
-              {k.label}
-            </option>
-          ))}
-        </select>
-        <span className="lab">{AUTH_KINDS.find((k) => k.id === draft.kind)?.help}</span>
-      </label>
+        <Select
+          ariaLabel="Sign-in"
+          value={draft.kind}
+          onChange={(kind: ApiAuthKind) => set({ kind })}
+          options={AUTH_KINDS.map((k) => ({ value: k.id, label: k.label, hint: k.help, icon: AUTH_ICONS[k.id] }))}
+        />
+      </div>
 
       {draft.kind === "api_key" && (
         <div className="grid gap-3 sm:grid-cols-[9rem_1fr]">
-          <label className="flex flex-col gap-1.5">
+          <div className="flex flex-col gap-1.5">
             <span className="lab">Sent in</span>
-            <select className="in" value={draft.location} onChange={(e) => set({ location: e.target.value as "header" | "query" })}>
-              <option value="header">A header</option>
-              <option value="query">The query string</option>
-            </select>
-          </label>
+            <Select
+              ariaLabel="Where the key is sent"
+              value={draft.location}
+              onChange={(location: "header" | "query") => set({ location })}
+              options={[
+                { value: "header", label: "A header" },
+                { value: "query", label: "The query string" },
+              ]}
+            />
+          </div>
           <label className="flex flex-col gap-1.5">
             <span className="lab">{draft.location === "header" ? "Header name" : "Parameter name"}</span>
             <input className="in font-mono" value={draft.keyName} onChange={(e) => set({ keyName: e.target.value })} placeholder={draft.location === "header" ? "X-API-Key" : "api_key"} />
@@ -222,13 +237,18 @@ export function AuthFields({ draft, onChange, editing = false }: { draft: AuthDr
             <span className="lab">Scope (optional)</span>
             <input className="in font-mono" value={draft.scope} onChange={(e) => set({ scope: e.target.value })} placeholder="api://hr/.default" />
           </label>
-          <label className="flex flex-col gap-1.5">
+          <div className="flex flex-col gap-1.5">
             <span className="lab">Send the client credentials</span>
-            <select className="in" value={draft.clientAuth} onChange={(e) => set({ clientAuth: e.target.value as "basic" | "body" })}>
-              <option value="basic">As Basic auth (most servers)</option>
-              <option value="body">In the form body</option>
-            </select>
-          </label>
+            <Select
+              ariaLabel="How the client credentials are sent"
+              value={draft.clientAuth}
+              onChange={(clientAuth: "basic" | "body") => set({ clientAuth })}
+              options={[
+                { value: "basic", label: "As Basic auth", hint: "Most servers" },
+                { value: "body", label: "In the form body" },
+              ]}
+            />
+          </div>
           <span className="lab sm:col-span-2">{secretHint}</span>
         </div>
       )}
@@ -270,13 +290,18 @@ export function AuthFields({ draft, onChange, editing = false }: { draft: AuthDr
                 <span className="lab">Password field</span>
                 <input className="in font-mono" value={draft.passwordField} onChange={(e) => set({ passwordField: e.target.value })} placeholder="password" />
               </label>
-              <label className="flex flex-col gap-1.5">
+              <div className="flex flex-col gap-1.5">
                 <span className="lab">Send as</span>
-                <select className="in" value={draft.bodyFormat} onChange={(e) => set({ bodyFormat: e.target.value as "json" | "form" })}>
-                  <option value="json">JSON body</option>
-                  <option value="form">Form fields</option>
-                </select>
-              </label>
+                <Select
+                  ariaLabel="Login request format"
+                  value={draft.bodyFormat}
+                  onChange={(bodyFormat: "json" | "form") => set({ bodyFormat })}
+                  options={[
+                    { value: "json", label: "JSON body" },
+                    { value: "form", label: "Form fields" },
+                  ]}
+                />
+              </div>
               <label className="flex flex-col gap-1.5">
                 <span className="lab">Token in the answer</span>
                 <input className="in font-mono" value={draft.tokenPath} onChange={(e) => set({ tokenPath: e.target.value })} placeholder="auto, e.g. data.token" />

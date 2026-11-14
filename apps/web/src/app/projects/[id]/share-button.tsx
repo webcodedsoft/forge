@@ -1,9 +1,10 @@
 "use client";
 
 import type { Invitation, ProjectMemberInfo, ProjectRole } from "@forge/protocol";
-import { Check, Copy, Users } from "lucide-react";
+import { Check, Copy, Eye, Hammer, ShieldCheck, Users } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Avatar } from "@/components/project-badge";
+import { Select, type SelectOption } from "@/components/select";
 import { api } from "@/lib/api";
 
 const ROLES: { id: ProjectRole; label: string; help: string }[] = [
@@ -11,6 +12,12 @@ const ROLES: { id: ProjectRole; label: string; help: string }[] = [
   { id: "builder", label: "Builder", help: "Asks the agent for changes, restores versions, edits settings" },
   { id: "viewer", label: "Viewer", help: "Sees the app, chat and versions, and comments" },
 ];
+const ROLE_OPTIONS: SelectOption<ProjectRole>[] = ROLES.map((r) => ({
+  value: r.id,
+  label: r.label,
+  hint: r.help,
+  icon: r.id === "admin" ? <ShieldCheck size={14} /> : r.id === "builder" ? <Hammer size={14} /> : <Eye size={14} />,
+}));
 
 type Data = {
   members: ProjectMemberInfo[];
@@ -39,7 +46,9 @@ export function ShareButton({ projectId, onError }: { projectId: string; onError
     if (!open) return;
     load();
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      // Dropdown menus render in <body> (components/select.tsx): a click in one isn't "outside".
+      if ((e.target as Element).closest?.(".forge-select-menu")) return;
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);
     document.addEventListener("mousedown", close);
@@ -82,18 +91,15 @@ export function ShareButton({ projectId, onError }: { projectId: string; onError
                 </span>
                 {isAdmin && !m.viaWorkspaceAdmin ? (
                   <>
-                    <select
-                      aria-label={`Role of ${m.name}`}
-                      className="in h-8 py-0 text-[13px]"
+                    <Select
+                      ariaLabel={`Role of ${m.name}`}
+                      size="sm"
+                      className="w-32"
+                      menuWidth="17rem"
                       value={m.role}
-                      onChange={(e) => act(() => api.setProjectMember(projectId, m.userId, e.target.value as ProjectRole))}
-                    >
-                      {ROLES.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.label}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(r) => act(() => api.setProjectMember(projectId, m.userId, r))}
+                      options={ROLE_OPTIONS}
+                    />
                     <button
                       type="button"
                       className="btn btn-g btn-sm btn-danger"
@@ -132,21 +138,16 @@ export function ShareButton({ projectId, onError }: { projectId: string; onError
                 >
                   <span className="lab">Add a teammate</span>
                   <div className="flex gap-2">
-                    <select aria-label="Teammate" className="in min-w-0 flex-1" value={addUser} onChange={(e) => setAddUser(e.target.value)}>
-                      <option value="">Choose…</option>
-                      {data.others.map((o) => (
-                        <option key={o.userId} value={o.userId}>
-                          {o.name} ({o.email})
-                        </option>
-                      ))}
-                    </select>
-                    <select aria-label="Role" className="in" value={addRole} onChange={(e) => setAddRole(e.target.value as ProjectRole)}>
-                      {ROLES.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.label}
-                        </option>
-                      ))}
-                    </select>
+                    <Select
+                      ariaLabel="Teammate"
+                      className="min-w-0 flex-1"
+                      placeholder="Choose a teammate…"
+                      searchable
+                      value={addUser}
+                      onChange={setAddUser}
+                      options={data.others.map((o) => ({ value: o.userId, label: o.name, hint: o.email }))}
+                    />
+                    <Select ariaLabel="Role" className="w-32" menuWidth="17rem" value={addRole} onChange={setAddRole} options={ROLE_OPTIONS} />
                     <button className="btn btn-p" disabled={!addUser}>
                       Add
                     </button>
@@ -170,13 +171,7 @@ export function ShareButton({ projectId, onError }: { projectId: string; onError
                 <span className="lab">Invite someone new by email</span>
                 <div className="flex gap-2">
                   <input aria-label="Email" type="email" required className="in min-w-0 flex-1" placeholder="name@company.com" value={email} onChange={(e) => setEmail(e.target.value)} />
-                  <select aria-label="Role" className="in" value={emailRole} onChange={(e) => setEmailRole(e.target.value as ProjectRole)}>
-                    {ROLES.map((r) => (
-                      <option key={r.id} value={r.id}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </select>
+                  <Select ariaLabel="Role" className="w-32" menuWidth="17rem" value={emailRole} onChange={setEmailRole} options={ROLE_OPTIONS} />
                   <button className="btn btn-p">Invite</button>
                 </div>
                 <span className="text-xs text-ink-2">{ROLES.find((r) => r.id === emailRole)?.help}. They join the team as a member.</span>

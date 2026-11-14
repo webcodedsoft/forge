@@ -1,6 +1,8 @@
 "use client";
 
+import { onPreviewAccessRequest, usePreviewEntry } from "./preview-entry";
 import type { Version, VersionCompare, VersionDiffFile } from "@forge/protocol";
+import { Select } from "@/components/select";
 import { ArrowRight, Columns2, FileCode2, Minus, Plus, RotateCw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Skeleton, SkeletonRows, Spinner } from "@/components/loading";
@@ -53,38 +55,43 @@ export function CompareView({
   if (!versions) return <SkeletonRows n={2} className="card" />;
   if (!effective) return <p className="text-ink-2">There is only one version so far. Changes appear here once the agent saves another.</p>;
 
-  const options = versions.map((v) => ({ value: v.sha, label: `${v.sha.slice(0, 7)} · ${v.message.slice(0, 60)}${v.current ? " (current)" : ""}` }));
+  const options = versions.map((v) => ({
+    value: v.sha,
+    label: `${v.sha.slice(0, 7)} · ${v.message.slice(0, 60)}`,
+    hint: `${v.current ? "Current · " : ""}${new Date(v.at).toLocaleString()}`,
+  }));
   const fromIsParent = effective.from.endsWith("^");
 
   return (
     <div className="pop mx-auto flex h-full max-w-6xl flex-col overflow-hidden">
       <div className="flex flex-wrap items-center gap-2 border-b border-line bg-surface px-3 py-2">
-        <label className="flex min-w-0 items-center gap-1.5 text-[13px]">
+        <div className="flex min-w-0 items-center gap-1.5 text-[13px]">
           <span className="lab">From</span>
-          <select
-            className="in h-8 max-w-[16rem] py-0 text-[13px]"
+          <Select
+            ariaLabel="Compare from"
+            size="sm"
+            searchable
+            className="w-64 max-w-full"
+            menuWidth="24rem"
             value={fromIsParent ? "" : effective.from}
-            onChange={(e) => e.target.value && onPair({ from: e.target.value, to: effective.to })}
-          >
-            {fromIsParent && <option value="">The version before {effective.from.slice(0, 7)}</option>}
-            {options.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(v) => v && onPair({ from: v, to: effective.to })}
+            options={[...(fromIsParent ? [{ value: "", label: `The version before ${effective.from.slice(0, 7)}` }] : []), ...options]}
+          />
+        </div>
         <ArrowRight size={14} className="text-ink-3" aria-hidden />
-        <label className="flex min-w-0 items-center gap-1.5 text-[13px]">
+        <div className="flex min-w-0 items-center gap-1.5 text-[13px]">
           <span className="lab">To</span>
-          <select className="in h-8 max-w-[16rem] py-0 text-[13px]" value={effective.to} onChange={(e) => onPair({ from: effective.from, to: e.target.value })}>
-            {options.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </label>
+          <Select
+            ariaLabel="Compare to"
+            size="sm"
+            searchable
+            className="w-64 max-w-full"
+            menuWidth="24rem"
+            value={effective.to}
+            onChange={(v) => onPair({ from: effective.from, to: v })}
+            options={options}
+          />
+        </div>
         <div className="seg ml-auto" role="tablist" aria-label="Compare as">
           <button role="tab" aria-selected={mode === "code"} className="mode" onClick={() => setMode("code")}>
             <FileCode2 size={14} aria-hidden />
@@ -290,6 +297,15 @@ function SideBySide({
   const [state, setState] = useState<{ ref: string; url?: string; sha?: string; error?: string } | null>(null);
   const [path, setPath] = useState("/");
   const [reload, setReload] = useState(0);
+  // Both previews are private: each frame opens through its own entry link (preview-entry.ts).
+  const [accessEpoch, setAccessEpoch] = useState(0);
+  const olderEntry = usePreviewEntry(projectId, Boolean(state?.url && state.ref === older), { compare: true, next: path, reloadKey: `${path}:${accessEpoch}` });
+  const currentEntry = usePreviewEntry(projectId, Boolean(previewUrl), { next: path, reloadKey: `${path}:${accessEpoch}` });
+  useEffect(() => {
+    const origins = [previewUrl && new URL(previewUrl).origin, state?.url && new URL(state.url).origin].filter(Boolean) as string[];
+    if (!origins.length) return;
+    return onPreviewAccessRequest(origins, () => setAccessEpoch((n) => n + 1));
+  }, [previewUrl, state?.url]);
 
   useEffect(() => {
     let cancelled = false;
@@ -334,7 +350,14 @@ function SideBySide({
           {ready?.error ? (
             <p className="p-4 text-danger">{ready.error}</p>
           ) : ready?.url ? (
-            <iframe key={`${ready.url}${path}${reload}`} src={ready.url + path} title="Older version" className="min-h-0 w-full flex-1 bg-white" />
+            olderEntry ? (
+              <iframe key={`${olderEntry}${reload}`} src={olderEntry} title="Older version" className="min-h-0 w-full flex-1 bg-white" />
+            ) : (
+              <p className="flex items-center gap-2 p-4 text-ink-2">
+                <Spinner size={14} className="spinner-pri" />
+                Opening…
+              </p>
+            )
           ) : (
             <p className="flex items-center gap-2 p-4 text-ink-2">
               <Spinner size={14} className="spinner-pri" />
@@ -345,7 +368,14 @@ function SideBySide({
         <figure className="flex min-h-[40vh] flex-col bg-surface">
           <figcaption className="lab border-b border-line px-3 py-1.5">Now</figcaption>
           {previewUrl ? (
-            <iframe key={path} src={previewUrl + path} title="Current version" className="min-h-0 w-full flex-1 bg-white" />
+            currentEntry ? (
+              <iframe key={currentEntry} src={currentEntry} title="Current version" className="min-h-0 w-full flex-1 bg-white" />
+            ) : (
+              <p className="flex items-center gap-2 p-4 text-ink-2">
+                <Spinner size={14} className="spinner-pri" />
+                Opening…
+              </p>
+            )
           ) : (
             <p className="p-4 text-ink-2">The app isn&apos;t running.</p>
           )}

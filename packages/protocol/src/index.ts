@@ -23,6 +23,8 @@ export const Project = z.object({
   autoQa: z.boolean().optional(),
   /** Daily spend limit for automatic QA, in US cents. */
   autoQaDailyBudgetCents: z.number().int().optional(),
+  /** Autonomous: the agent builds start to finish without stopping for plan approval or questions. */
+  autonomous: z.boolean().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -30,6 +32,8 @@ export type Project = z.infer<typeof Project>;
 
 export const CreateProjectInput = z.object({
   name: z.string().trim().min(1).max(80),
+  /** The name was made from the request (deriveProjectName), not typed: Forge may suggest a better one. */
+  autoName: z.boolean().optional(),
   description: z.string().trim().max(2000).optional(),
   /** Start from a team template instead of the blank app. */
   templateId: z.string().optional(),
@@ -45,7 +49,10 @@ export const ImportProjectInput = z.object({
 export type ImportProjectInput = z.infer<typeof ImportProjectInput>;
 
 export const ProjectSettingsInput = z.object({
+  /** Rename the project (builders and admins). */
+  name: z.string().trim().min(1, "Give the project a name.").max(80, "Project names can be up to 80 characters.").optional(),
   autoQa: z.boolean().optional(),
+  autonomous: z.boolean().optional(),
   /** $0.10 to $50 per day. */
   autoQaDailyBudgetCents: z.number().int().min(10).max(5000).optional(),
 });
@@ -142,6 +149,9 @@ export const RunEvent = z.discriminatedUnion("type", [
     type: z.literal("run.started"),
     prompt: z.string(),
     model: z.string(),
+    /** The model's display name and provider (Settings › Integrations › AI model), when known. */
+    modelLabel: z.string().optional(),
+    provider: z.enum(["anthropic", "openai"]).optional(),
     userId: z.string(),
     userName: z.string(),
     /** "qa" runs test the app in a browser and report issues; they never change code. */
@@ -250,6 +260,10 @@ export const RunEvent = z.discriminatedUnion("type", [
     cacheReadTokens: z.number(),
     /** Cost of this run. */
     costUsd: z.number(),
+    /** True when part of the cost had no known price (an OpenAI model without one): it's an estimate. */
+    costEstimated: z.boolean().optional(),
+    /** "forge": priced by Forge's model proxy per request (ChatGPT runs). Missing: the agent's own figure. */
+    pricedBy: z.literal("forge").optional(),
     /** Cumulative cost of the agent session (the SDK's total_cost_usd), used to derive per-run cost. */
     sessionCostUsd: z.number().optional(),
   }),
@@ -286,19 +300,50 @@ export type SandboxStatus = {
 /** design: rebuild an attached design (screenshot or Figma frame) as working UI. */
 export const RunMode = z.enum(["build", "chat", "plan", "design"]);
 export type RunMode = z.infer<typeof RunMode>;
-export const StartRunInput = z.object({ prompt: z.string().trim().min(1).max(20000), mode: RunMode.default("build") });
+export const StartRunInput = z.object({
+  prompt: z.string().trim().min(1).max(20000),
+  mode: RunMode.default("build"),
+  /** "provider:model", one of the models the admin allows. Omitted: the project's last choice or the default. */
+  model: z.string().max(160).optional(),
+});
 export type StartRunInput = z.infer<typeof StartRunInput>;
+
+/** A request waiting for the agent to finish its current run. */
+export type QueuedMessage = { id: string; prompt: string; mode: RunMode; model: string | null; userId: string; userName: string; createdAt: string };
+
+/** POST /runs: started now, or queued because the agent is busy. */
+export type StartRunResponse = { runId: string; queued?: false } | { queued: true; queuedId: string; position: number };
 
 /* -------------------------------- Pauses -------------------------------- */
 
 export type QuestionPayload = { questions: { id: string; question: string; options: string[] }[] };
-export type PlanPayload = { title: string; plan: string };
+/** One step of a plan: what gets done, optionally how. */
+export type PlanStep = { id: string; title: string; detail?: string; /** The agent suggests it but it isn't required. */ optional?: boolean };
+/**
+ * A plan to approve. New plans have a summary and steps (shown in the Plan panel, where people
+ * keep, edit, remove and add steps); older ones only have Markdown in `plan`.
+ */
+export type PlanPayload = { title: string; plan: string; summary?: string; steps?: PlanStep[] };
 
 export const QuestionAnswer = z.object({ answers: z.record(z.string(), z.string().max(2000)) });
 export const PlanAnswer = z.object({
   decision: z.enum(["approve", "revise"]),
   feedback: z.string().max(5000).optional(),
   plan: z.string().max(50000).optional(),
+  /** The steps as the person left them, in order: the agent's (maybe edited) and their own. */
+  steps: z
+    .array(
+      z.object({
+        title: z.string().trim().min(1).max(500),
+        detail: z.string().max(2000).optional(),
+        origin: z.enum(["agent", "user"]),
+        edited: z.boolean().optional(),
+      }),
+    )
+    .max(100)
+    .optional(),
+  /** Titles of the agent's steps the person unticked. */
+  removed: z.array(z.string().max(500)).max(100).optional(),
 });
 export const AnswerPauseInput = z.union([QuestionAnswer, PlanAnswer]);
 export type AnswerPauseInput = z.infer<typeof AnswerPauseInput>;
@@ -503,6 +548,72 @@ export type IntegrationsStatus = {
         connectedAt: string;
       };
   figma: { configured: false } | { configured: true; user: string | null; updatedBy: string; updatedAt: string };
+  ai: AiSettings;
+};
+
+/** Which AI builds the apps (Settings › Integrations › AI model). */
+export type AiProvider = "anthropic" | "openai";
+
+export type AiSettings = {
+  provider: AiProvider;
+  /** The model the agent uses, e.g. "claude-opus-5-5" or an OpenAI model id. */
+  model: string;
+  /** A cheaper model for small background steps (titles, command checks). null: same as `model`. */
+  fastModel: string | null;
+  /** Whether each provider has an API key, and where it comes from. */
+  keys: Record<AiProvider, { source: "settings" | "env" | null; last4: string | null; updatedBy: string | null }>;
+  /** Models people may pick per message (always includes the default). */
+  allowed: AllowedModel[];
+  updatedBy: string | null;
+  updatedAt: string | null;
+};
+
+/** USD per million tokens. */
+export type ModelPrice = { input: number; cachedInput: number; output: number };
+
+export type AiModel = { id: string; label: string; hint?: string; /** OpenAI list price, when Forge knows it. */ price?: ModelPrice | null };
+
+/** How expensive a model is, roughly: 1 €, 2 €€, 3 €€€. */
+export type CostTier = 1 | 2 | 3;
+
+/**
+ * Whether a model can build (it needs tool use: editing files, running commands) or only chat.
+ * Claude models all can; OpenAI's chat-only families (ChatGPT snapshots, o1-mini/preview, search
+ * and audio models) can't. Used by the server (runs) and the UI (pickers) alike.
+ */
+export function modelCanCode(provider: AiProvider, id: string): boolean {
+  if (provider === "anthropic") return true;
+  return !/^chatgpt-|^o1-(mini|preview)|search|audio|realtime|transcribe|tts|instruct|^gpt-3\.5-turbo-instruct/.test(id);
+}
+
+/** A model people may pick in the prompt box (chosen by an admin). */
+export type AllowedModel = {
+  provider: AiProvider;
+  id: string;
+  label: string;
+  hint: string;
+  cost: CostTier;
+  /** OpenAI models: what Forge charges on the Usage page. null/missing: Forge's list price, if it knows one. */
+  price?: ModelPrice | null;
+};
+
+/** GET /projects/:id/models: what the prompt box's model picker offers. */
+export type ProjectModels = {
+  models: (AllowedModel & { key: string; available: boolean; canCode: boolean })[];
+  /** "provider:model" of the workspace default. */
+  defaultKey: string;
+  /** "provider:model" the project used last (if still allowed), else the default. */
+  currentKey: string;
+};
+
+export type UpdateAiSettingsInput = {
+  provider: AiProvider;
+  model: string;
+  fastModel?: string | null;
+  /** A new API key for `provider` (checked before it's saved). */
+  apiKey?: string;
+  /** Models people may pick per message. Omitted: unchanged. */
+  allowed?: AllowedModel[];
 };
 
 /** Where the project's code lives on GitHub, and whether Forge can create a repo for it. */
@@ -698,6 +809,8 @@ export type CreateCommentInput = z.infer<typeof CreateCommentInput>;
 export const UpdateCommentInput = z.object({
   resolved: z.boolean().optional(),
   body: z.string().trim().min(1).max(4000).optional(),
+  /** Re-anchor: the preview found the pinned element again after the page changed; its new CSS path. */
+  selector: z.string().min(1).max(1000).optional(),
 });
 
 export type ProjectComment = {
@@ -807,5 +920,90 @@ export type ServerFrame =
   | { type: "problems_changed"; projectId: string }
   /** A new security report is available. */
   | { type: "security_changed"; projectId: string }
+  /** The message queue changed (queued, removed or started); clients refetch it. */
+  | { type: "queue_changed"; projectId: string }
+  /** The project's details changed (e.g. Forge named it); clients refetch the project. */
+  | { type: "project_changed"; projectId: string }
   | { type: "pong" }
   | { type: "error"; message: string };
+
+/**
+ * A run's error as people should read it: the provider's message, without the agent's wrapper
+ * ("Claude Code returned an error result", "API Error: 400", "Request rejected (429)"), stack
+ * traces or telemetry. Used when a run's error is stored and when older errors are shown.
+ */
+export function cleanRunError(raw: string | undefined | null): string {
+  if (!raw) return "The agent stopped unexpectedly.";
+  let s = raw;
+  // Stack traces ("at fS.readMessages (file:///…)") and the telemetry object after them.
+  s = s.replace(/\s+at\s+[\w$.<>[\]]+\s+\((?:file|node):[\s\S]*$/, "");
+  s = s.replace(/\s*\{\s*telemetryMessage[\s\S]*$/, "");
+  s = s.replace(/^\s*(?:Error:\s*)?Claude Code returned an error result:\s*/i, "");
+  s = s.replace(/^API Error:\s*/i, "");
+  s = s.replace(/^Request rejected \(\d{3}\)\s*·\s*/i, "");
+  s = s.replace(/^\d{3}\s+(?=[A-Z{])/, "");
+  // A JSON error body: keep its message.
+  const json = /^\{[\s\S]*"message"\s*:\s*"((?:[^"\\]|\\.)*)"[\s\S]*\}$/.exec(s.trim());
+  if (json) s = json[1]!.replace(/\\"/g, '"');
+  if (/ANTHROPIC_API_KEY is not set/.test(s)) s = "No API key for the AI model. An admin can add one in Settings › Integrations › AI model.";
+  s = s.trim();
+  return s || "The agent stopped unexpectedly.";
+}
+
+/* ----------------------------- preview sharing ----------------------------- */
+
+export const PREVIEW_SHARE_DURATIONS = ["1h", "24h", "7d", "30d"] as const;
+export type PreviewShareDuration = (typeof PREVIEW_SHARE_DURATIONS)[number];
+
+/** A link that lets anyone view a project's preview until it expires or is revoked. */
+export type PreviewShare = {
+  id: string;
+  label: string | null;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+  uses: number;
+  /** Only returned once, when the link is created (Forge keeps a hash, not the link). */
+  url?: string;
+};
+
+export const CreatePreviewShareInput = z.object({
+  duration: z.enum(PREVIEW_SHARE_DURATIONS),
+  label: z.string().trim().max(80).optional(),
+});
+
+/* ------------------------------ project names ------------------------------ */
+
+const SMALL_WORDS = new Set(["a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs", "with"]);
+const titleCase = (words: string[]) =>
+  words.map((w, i) => (i > 0 && SMALL_WORDS.has(w.toLowerCase()) ? w.toLowerCase() : /^[A-Z0-9]{2,}$/.test(w) ? w : w[0]!.toUpperCase() + w.slice(1).toLowerCase())).join(" ");
+
+/**
+ * A project name from someone's request, without AI: drop the lead-in ("I want you to build me a…",
+ * "Can you create…"), cut at the first clause ("…where people vote", "…that shows…"), and keep the
+ * core in title case, up to 4 words. "I want you to build a team lunch poll where people vote" →
+ * "Team Lunch Poll".
+ */
+export function deriveProjectName(text: string): string {
+  let s = text.replace(/\s+/g, " ").trim().split(/[.!?\n]/)[0] ?? "";
+  // Lead-ins, repeated: "Hi, can you please build me a simple…"
+  const lead =
+    /^(hi|hello|hey|ok|okay|so|please|pls|kindly|i (?:want|would like|need|wanna)(?: you)?(?: to)?|we (?:want|need)(?: you)?(?: to)?|(?:can|could|would) you(?: please)?|let'?s|help me(?: to)?|i'?d like(?: you)?(?: to)?|build|create|make|design|develop|generate|write|set up|setup|start|add|me|us|an?|the|new|simple|small|basic|quick|nice|modern|beautiful|full|complete|internal|web|app for|application for|tool for)\b[ ,:-]*/i;
+  for (let i = 0; i < 12 && lead.test(s); i++) s = s.replace(lead, "");
+  // Cut at the first clause or list.
+  s = s.split(/\s(?:where|that|which|who|so|to help|to let|to manage|with|using|including|for (?:our|my|the|people|users|teams?|employees|staff)|in which|like)\s|[,;:(–—-]\s?/i)[0] ?? s;
+  const words = s.replace(/[^\p{L}\p{N}&+'\s-]/gu, " ").trim().split(/\s+/).filter(Boolean).slice(0, 4);
+  while (words.length > 1 && SMALL_WORDS.has(words[words.length - 1]!.toLowerCase())) words.pop();
+  const name = titleCase(words);
+  // Too vague to be a name ("this page", "it", "an app"): a placeholder until Forge suggests one.
+  if (name.length < 2 || /^(this|that|it|something|stuff|things?|page|pages|this page|that page|this one|this design|this app|app|apps|website|site|ui|screen)$/i.test(name)) return "New app";
+  return name.slice(0, 60);
+}
+
+/** A readable name from a repository name: "doctorflix-web" → "Doctorflix Web". */
+export function prettyRepoName(repo: string): string {
+  const words = repo.replace(/\.git$/, "").split(/[-_.\s]+/).filter(Boolean);
+  return words.length ? titleCase(words).slice(0, 80) : repo;
+}

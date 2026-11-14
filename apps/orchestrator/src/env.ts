@@ -28,6 +28,10 @@ const Env = z.object({
     .default("http://{id}.preview.localhost:7777")
     .refine((v) => v.includes("{id}"), "PREVIEW_URL_TEMPLATE must contain {id}"),
   ANTHROPIC_API_KEY: z.string().optional(),
+  /** ChatGPT (Settings › Integrations › AI model). A key added in Settings wins over this one. */
+  OPENAI_API_KEY: z.string().optional(),
+  /** OpenAI-compatible API base (tests point this at a local mock). */
+  OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   /** Model the build agent uses. */
   FORGE_MODEL: z.string().default("claude-opus-5-5"),
   /** Comma-separated email domains allowed to sign up. Empty = anyone who can reach the app. */

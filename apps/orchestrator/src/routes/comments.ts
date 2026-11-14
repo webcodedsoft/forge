@@ -84,9 +84,16 @@ export const comments = new Hono<AppEnv>()
     if (parsed.data.resolved !== undefined && row.parentId) {
       return c.json({ error: "Resolve the thread, not a reply." }, 400);
     }
+    // Re-anchoring keeps everything else about where the comment points (page, label, html).
+    const anchor = row.anchor as CommentAnchor | null;
+    const reanchor = parsed.data.selector !== undefined && anchor && anchor.selector !== parsed.data.selector;
+    if (parsed.data.selector !== undefined && !reanchor && parsed.data.body === undefined && parsed.data.resolved === undefined) {
+      return c.json({ ok: true });
+    }
     await db
       .update(schema.projectComment)
       .set({
+        ...(reanchor ? { anchor: { ...anchor, selector: parsed.data.selector! } } : {}),
         ...(parsed.data.body !== undefined ? { body: parsed.data.body } : {}),
         ...(parsed.data.resolved !== undefined
           ? { resolved: parsed.data.resolved, resolvedBy: parsed.data.resolved ? user.name : null }

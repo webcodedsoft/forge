@@ -1,6 +1,6 @@
 "use client";
 
-import { Coins, FlaskConical, Hammer } from "lucide-react";
+import { Coins, FlaskConical, Hammer, Info } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -12,6 +12,8 @@ import { ApiError } from "@/lib/api";
 type Usage = {
   days: number;
   totals: { costUsd: number; runs: number; qaRuns: number };
+  /** Runs whose cost is an estimate (an OpenAI model without a price). */
+  estimatedRuns?: number;
   byProject: { projectId: string; name: string; runs: number; qaRuns: number; costUsd: number; lastRunAt: string }[];
   byUser: { userName: string; runs: number; costUsd: number }[];
   byDay: { day: string; costUsd: number }[];
@@ -83,6 +85,19 @@ export default function UsagePage() {
         <UsageSkeleton />
       ) : (
         <div className={`transition-opacity ${switching ? "opacity-60" : ""}`} aria-busy={switching}>
+          {(data.estimatedRuns ?? 0) > 0 && (
+            <p className="mt-5 flex items-start gap-2 rounded-[10px] border border-warn/30 bg-warn-weak px-3.5 py-2.5 text-[13px]" role="status">
+              <Info size={15} className="mt-0.5 shrink-0 text-warn" aria-hidden />
+              <span>
+                {data.estimatedRuns} run{data.estimatedRuns === 1 ? "" : "s"} used a model without a price, so {data.estimatedRuns === 1 ? "its" : "their"} cost is
+                an estimate. Set the model&apos;s price in{" "}
+                <Link href="/settings/integrations?tab=ai" className="font-medium text-primary underline">
+                  Settings › Integrations › AI model
+                </Link>
+                .
+              </span>
+            </p>
+          )}
           <section className="mt-6 grid gap-3 sm:grid-cols-3" aria-label="Totals">
             {(
               [

@@ -99,7 +99,7 @@ export function PreviewTabs({
   useEffect(() => {
     if (!menu) return;
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setMenu(null);
+      if (box.current && !e.composedPath().includes(box.current)) setMenu(null);
     };
     const key = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setMenu(null), 0);

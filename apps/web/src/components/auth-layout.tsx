@@ -1,4 +1,5 @@
 import { Bot, MessageSquare, ShieldCheck } from "lucide-react";
+import { ForgeMark } from "./forge-mark";
 import { ThemeToggle } from "./theme-toggle";
 
 /** Two-column layout for sign-in and invitation pages: brand panel + form card. */
@@ -7,7 +8,7 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
     <main className="grid min-h-dvh flex-1 lg:grid-cols-[minmax(0,1fr)_minmax(420px,520px)]">
       <section className="dots relative hidden flex-col justify-between border-r border-line p-10 lg:flex">
         <div className="flex items-center gap-2 text-lg font-bold">
-          <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-sm text-primary-fg">F</span>
+          <ForgeMark size={32} />
           Forge
         </div>
         <div className="max-w-lg">
@@ -50,7 +51,7 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
         </div>
         <div className="w-full max-w-sm">
           <div className="mb-8 flex items-center gap-2 text-lg font-bold lg:hidden">
-            <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-sm text-primary-fg">F</span>
+            <ForgeMark size={32} />
             Forge
           </div>
           {children}

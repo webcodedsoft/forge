@@ -12,6 +12,12 @@ import { type ReactNode, useEffect, useId, useRef } from "react";
  *     <form>…</form>
  *   </Modal>
  */
+/** Whether a point is outside the dialog's box (on the backdrop). */
+function outside(d: HTMLElement, x: number, y: number) {
+  const r = d.getBoundingClientRect();
+  return x < r.left || x > r.right || y < r.top || y > r.bottom;
+}
+
 export function Modal({
   open,
   onClose,
@@ -35,6 +41,8 @@ export function Modal({
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   const descId = useId();
+  /** Whether the current press started on the backdrop (outside the box). */
+  const pressedOutside = useRef(false);
 
   useEffect(() => {
     const d = ref.current;
@@ -53,8 +61,15 @@ export function Modal({
         e.preventDefault();
         if (!busy) onClose();
       }}
+      onPointerDown={(e) => {
+        pressedOutside.current = e.target === e.currentTarget && outside(e.currentTarget, e.clientX, e.clientY);
+      }}
       onClick={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
+        // Close only when the press started and ended on the backdrop, so a drag that ends outside,
+        // or a click on a control's hidden part, never closes it.
+        const close = pressedOutside.current && e.target === e.currentTarget && outside(e.currentTarget, e.clientX, e.clientY);
+        pressedOutside.current = false;
+        if (close && !busy) onClose();
       }}
     >
       {open && (

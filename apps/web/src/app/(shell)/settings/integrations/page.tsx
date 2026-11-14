@@ -1,14 +1,18 @@
 "use client";
 
-import type { IntegrationsStatus } from "@forge/protocol";
-import { CheckCircle2, ChevronRight, ExternalLink, GitBranch, KeyRound, PenTool, ShieldCheck, TriangleAlert } from "lucide-react";
+import type { AiModel, AiProvider, AiSettings, AllowedModel, IntegrationsStatus } from "@forge/protocol";
+import { modelCanCode } from "@forge/protocol";
+import { Bot, BrainCircuit, CheckCircle2, ChevronRight, ExternalLink, GitBranch, Info, KeyRound, PenTool, ShieldCheck, Sparkles, TriangleAlert } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { BusyLabel, Skeleton } from "@/components/loading";
 import { ApiError, api } from "@/lib/api";
 import { isAdmin, useMe } from "@/lib/me";
+import { OptionCard } from "@/components/option-card";
+import { Select, type SelectOption } from "@/components/select";
+import { AllowedModels, COST_HINT, guessCost, modelOptions } from "./allowed-models";
 
-/** Settings › Integrations: connect the company's GitHub and Figma (workspace admins). */
+/** Settings › Integrations: the AI that builds apps, the company's GitHub, and Figma (workspace admins). */
 export default function IntegrationsPage() {
   return (
     <Suspense fallback={<PageSkeleton />}>
@@ -22,7 +26,12 @@ function PageSkeleton() {
     <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6">
       <Skeleton className="h-7 w-48" />
       <Skeleton className="skel-line mt-3 w-80 max-w-full opacity-70" />
-      {[0, 1].map((i) => (
+      <div className="mt-6 flex gap-4 border-b border-line pb-2.5">
+        {[0, 1, 2].map((i) => (
+          <Skeleton key={i} className="skel-line w-20" />
+        ))}
+      </div>
+      {[0].map((i) => (
         <div key={i} className="card mt-6 flex gap-4 p-5">
           <Skeleton className="size-11 shrink-0 rounded-xl" />
           <div className="flex flex-1 flex-col gap-2">
@@ -54,15 +63,30 @@ function Integrations() {
   );
   useEffect(() => {
     void load();
-    // Drop ?github=…/?error=… from the address once shown.
-    if (params.size) router.replace("/settings/integrations");
-  }, [load, params, router]);
+  }, [load]);
+
+  // The open tab is in the address (?tab=github), so links and reloads come back to it. GitHub's
+  // redirects (?github=connected, ?error=…) open the GitHub tab.
+  const [tab, setTab] = useState<TabId>(() => {
+    const t = params.get("tab");
+    if (TABS.some((x) => x.id === t)) return t as TabId;
+    return params.has("github") || params.has("error") ? "github" : "ai";
+  });
+  const choose = (t: TabId) => {
+    setTab(t);
+    setError(null);
+    window.history.replaceState(null, "", `/settings/integrations?tab=${t}`);
+  };
+  useEffect(() => {
+    // Drop ?github=…/?error=… once shown.
+    if (params.has("github") || params.has("error")) router.replace(`/settings/integrations?tab=github`);
+  }, [params, router]);
 
   if (me && !isAdmin(me)) {
     return (
       <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6">
         <h1 className="h1">Integrations</h1>
-        <p className="mt-2 text-ink-2">Only workspace admins can connect GitHub and Figma.</p>
+        <p className="mt-2 text-ink-2">Only workspace admins can change the AI model and connect GitHub and Figma.</p>
       </main>
     );
   }
@@ -84,11 +108,47 @@ function Integrations() {
           {error}
         </p>
       )}
-      <GitHubCard status={status.github} onChange={load} onError={setError} />
-      <FigmaCard status={status.figma} onChange={load} onError={setError} />
+      <div role="tablist" aria-label="Integrations" className="mt-6 flex flex-wrap gap-1 border-b border-line">
+        {TABS.map((t) => {
+          const on = t.connected(status);
+          return (
+            <button
+              key={t.id}
+              id={`int-tab-${t.id}`}
+              role="tab"
+              aria-selected={tab === t.id}
+              aria-controls={`int-panel-${t.id}`}
+              onClick={() => choose(t.id)}
+              className={`-mb-px flex shrink-0 items-center gap-2 border-b-2 px-3.5 py-2.5 text-[13.5px] font-medium transition-colors ${
+                tab === t.id ? "border-primary text-primary" : "border-transparent text-ink-2 hover:text-ink"
+              }`}
+            >
+              <t.icon size={15} aria-hidden />
+              {t.label}
+              <span
+                className={`size-1.5 rounded-full ${on ? "bg-ok" : "bg-ink-3/50"}`}
+                aria-label={on ? "Connected" : "Not set up"}
+                title={on ? "Connected" : "Not set up"}
+              />
+            </button>
+          );
+        })}
+      </div>
+      <div role="tabpanel" id={`int-panel-${tab}`} aria-labelledby={`int-tab-${tab}`} className="fade-in [&>section]:mt-5" key={tab}>
+        {tab === "ai" && <AiCard status={status.ai} onChange={load} onError={setError} />}
+        {tab === "github" && <GitHubCard status={status.github} onChange={load} onError={setError} />}
+        {tab === "figma" && <FigmaCard status={status.figma} onChange={load} onError={setError} />}
+      </div>
     </main>
   );
 }
+
+type TabId = "ai" | "github" | "figma";
+const TABS: { id: TabId; label: string; icon: typeof BrainCircuit; connected: (s: IntegrationsStatus) => boolean }[] = [
+  { id: "ai", label: "AI model", icon: BrainCircuit, connected: (s) => s.ai.keys[s.ai.provider].source !== null },
+  { id: "github", label: "GitHub", icon: GitBranch, connected: (s) => s.github.state === "connected" },
+  { id: "figma", label: "Figma", icon: PenTool, connected: (s) => s.figma.configured },
+];
 
 function Card({ icon, title, state, children }: { icon: React.ReactNode; title: string; state: React.ReactNode; children: React.ReactNode }) {
   return (
@@ -389,10 +449,6 @@ function FigmaCard({ status, onChange, onError }: { status: IntegrationsStatus["
 function GitHubSteps() {
   const steps = [
     {
-      title: "Create Forge's app (first time only)",
-      text: "GitHub shows a \u201cCreate GitHub App\u201d page. Click the green button. Forge needs its own app; this happens once per Forge installation.",
-    },
-    {
       title: "Pick your organization",
       text: "GitHub lists your account and every organization you belong to. Choose the company's organization and \u201cAll repositories\u201d.",
     },
@@ -410,5 +466,305 @@ function GitHubSteps() {
         </li>
       ))}
     </ol>
+  );
+}
+
+/* --------------------------------- AI model -------------------------------- */
+
+const PROVIDERS: { id: AiProvider; title: string; text: string; icon: React.ReactNode; keyHint: string; keyPlaceholder: string }[] = [
+  {
+    id: "anthropic",
+    title: "Claude",
+    text: "Anthropic's models. Forge's agent is built for them.",
+    icon: <Sparkles size={16} aria-hidden />,
+    keyHint: "Anthropic Console › API keys",
+    keyPlaceholder: "sk-ant-…",
+  },
+  {
+    id: "openai",
+    title: "ChatGPT",
+    text: "OpenAI's models, with the same agent, tools and checks.",
+    icon: <Bot size={16} aria-hidden />,
+    keyHint: "platform.openai.com › API keys",
+    keyPlaceholder: "sk-…",
+  },
+];
+
+function AiCard({ status, onChange, onError }: { status: AiSettings; onChange: () => void; onError: (m: string | null) => void }) {
+  const [provider, setProvider] = useState<AiProvider>(status.provider);
+  const [model, setModel] = useState(status.model);
+  const [fastModel, setFastModel] = useState<string | null>(status.fastModel);
+  const [apiKey, setApiKey] = useState("");
+  const [replacingKey, setReplacingKey] = useState(false);
+  const [models, setModels] = useState<AiModel[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [allowed, setAllowed] = useState<AllowedModel[]>(status.allowed);
+
+  const key = status.keys[provider];
+  const hasKey = key.source !== null;
+  const meta = PROVIDERS.find((p) => p.id === provider)!;
+
+  const loadModels = useCallback(
+    async (p: AiProvider, withKey?: string) => {
+      setLoading(true);
+      onError(null);
+      try {
+        const r = await api.aiModels(p, withKey);
+        setModels(r.models);
+        return r.models;
+      } catch (e) {
+        setModels(null);
+        onError(e instanceof Error ? e.message : String(e));
+        return null;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [onError],
+  );
+
+  // The saved provider's models (again after a save, e.g. with a new key).
+  const savedSource = status.keys[status.provider].source;
+  useEffect(() => {
+    if (!savedSource && status.provider !== "anthropic") return;
+    let live = true;
+    api.aiModels(status.provider).then(
+      (r) => live && setModels(r.models),
+      (e) => live && onError(e instanceof Error ? e.message : String(e)),
+    );
+    return () => {
+      live = false;
+    };
+  }, [status.provider, savedSource, onError]);
+
+  function choose(p: AiProvider) {
+    if (p === provider) return;
+    setProvider(p);
+    setApiKey("");
+    setReplacingKey(false);
+    setSaved(false);
+    setModels(null);
+    // Keep the saved choice when switching back; otherwise pick after the list loads.
+    setModel(p === status.provider ? status.model : "");
+    setFastModel(p === status.provider ? status.fastModel : null);
+    if (status.keys[p].source || p === "anthropic") {
+      void loadModels(p).then((list) => {
+        if (list?.length && p !== status.provider) setModel(list[0]!.id);
+      });
+    }
+  }
+
+  async function checkKey() {
+    const list = await loadModels(provider, apiKey.trim());
+    if (list?.length && !list.some((m) => m.id === model)) setModel(list[0]!.id);
+  }
+
+  async function save() {
+    setBusy("save");
+    onError(null);
+    try {
+      await api.updateAi({ provider, model, fastModel, allowed: allowedView, ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) });
+      setApiKey("");
+      setReplacingKey(false);
+      setSaved(true);
+      onChange();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // The saved model stays pickable even if the provider no longer lists it.
+  const options: SelectOption[] = modelOptions(models ?? [], provider, allowed);
+  // The default model has to build apps, so chat-only models can't be picked for it.
+  const defaultOptions: SelectOption[] = options.map((o) => (modelCanCode(provider, o.value) ? o : { ...o, disabled: true }));
+  if (model && !options.some((o) => o.value === model)) options.unshift({ value: model, label: model, hint: "Current model" });
+  const fastOptions: SelectOption[] = [
+    { value: "", label: provider === "anthropic" ? "Default (Claude Haiku)" : "Same as the main model" },
+    ...options.filter((o) => o.value !== model),
+  ];
+  const needsKey = !hasKey || replacingKey;
+  // The default model is always on the allowed list (first, when it isn't there yet).
+  const allowedView: AllowedModel[] =
+    !model || allowed.some((m) => m.provider === provider && m.id === model)
+      ? allowed
+      : [
+          {
+            provider,
+            id: model,
+            label: options.find((o) => o.value === model)?.label ?? model,
+            hint: COST_HINT[guessCost(model)],
+            cost: guessCost(model),
+          },
+          ...allowed,
+        ];
+  const keyedProviders = (["anthropic", "openai"] as AiProvider[]).filter((p) => status.keys[p].source !== null);
+  // Field order differs between the server's copy and ours, so compare field by field.
+  const sameAllowed =
+    allowedView.length === status.allowed.length &&
+    allowedView.every((m, i) => {
+      const o = status.allowed[i]!;
+      const samePrice = JSON.stringify(m.price ? [m.price.input, m.price.cachedInput, m.price.output] : null) ===
+        JSON.stringify(o.price ? [o.price.input, o.price.cachedInput, o.price.output] : null);
+      return m.provider === o.provider && m.id === o.id && m.label === o.label && m.hint === o.hint && m.cost === o.cost && samePrice;
+    });
+  const changed = !sameAllowed || provider !== status.provider || model !== status.model || (fastModel ?? null) !== (status.fastModel ?? null) || Boolean(apiKey.trim());
+  const current = PROVIDERS.find((p) => p.id === status.provider)!;
+
+  return (
+    <Card
+      icon={<BrainCircuit size={22} aria-hidden />}
+      title="AI model"
+      state={
+        status.keys[status.provider].source ? (
+          <span className="pill pill-ok">
+            {current.title} · {status.model}
+          </span>
+        ) : (
+          <span className="pill pill-warn">No API key</span>
+        )
+      }
+    >
+      <p className="text-ink-2">Choose the AI that builds and changes apps for everyone in the workspace. A change applies from the next request.</p>
+
+      <div role="radiogroup" aria-label="AI provider" className="grid gap-2 sm:grid-cols-2">
+        {PROVIDERS.map((p) => (
+          <OptionCard
+            key={p.id}
+            selected={provider === p.id}
+            onSelect={() => choose(p.id)}
+            title={p.title}
+            text={p.text}
+            icon={p.icon}
+            badge={status.provider === p.id ? <span className="pill pill-pri">In use</span> : undefined}
+          />
+        ))}
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <span className="lab">{meta.title} API key</span>
+        {!needsKey ? (
+          <div className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-surface-2 px-3 py-2 text-[13px]">
+            <KeyRound size={15} className="text-ink-3" aria-hidden />
+            <span className="font-mono">••••{key.last4}</span>
+            <span className="text-ink-3">{key.source === "env" ? "from the server's .env file" : `added by ${key.updatedBy ?? "an admin"}`}</span>
+            <span className="ml-auto flex gap-1.5">
+              <button type="button" className="btn btn-sm" onClick={() => setReplacingKey(true)}>
+                Replace
+              </button>
+              {key.source === "settings" && (
+                <button
+                  type="button"
+                  className="btn btn-g btn-sm btn-danger"
+                  aria-busy={busy === "remove"}
+                  onClick={() => {
+                    setBusy("remove");
+                    void api
+                      .removeAiKey(provider)
+                      .then(onChange, (e) => onError(e instanceof Error ? e.message : String(e)))
+                      .finally(() => setBusy(null));
+                  }}
+                >
+                  <BusyLabel busy={busy === "remove"}>Remove</BusyLabel>
+                </button>
+              )}
+            </span>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex gap-2">
+              <input
+                className="in flex-1 font-mono"
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder={meta.keyPlaceholder}
+                autoComplete="off"
+                aria-label={`${meta.title} API key`}
+              />
+              <button type="button" className="btn btn-sm h-auto" disabled={apiKey.trim().length < 20 || loading} onClick={() => void checkKey()}>
+                <BusyLabel busy={loading} busyText="Checking…">
+                  Check key
+                </BusyLabel>
+              </button>
+              {replacingKey && (
+                <button type="button" className="btn btn-g btn-sm h-auto" onClick={() => setReplacingKey(false)}>
+                  Cancel
+                </button>
+              )}
+            </div>
+            <p className="lab">
+              Create one in {meta.keyHint}. It&apos;s stored encrypted and never reaches project sandboxes.
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="flex flex-col gap-1.5">
+          <span className="lab">Model</span>
+          <Select
+            ariaLabel="Model"
+            value={model}
+            onChange={(v) => {
+              setModel(v);
+              setSaved(false);
+              if (v === fastModel) setFastModel(null);
+            }}
+            options={defaultOptions}
+            searchable
+            disabled={!models && !model}
+            placeholder={loading ? "Loading models…" : needsKey ? "Check the key to see models" : "Choose a model"}
+          />
+        </label>
+        <label className="flex flex-col gap-1.5">
+          <span className="lab">Model for small steps</span>
+          <Select
+            ariaLabel="Model for small steps"
+            value={fastModel ?? ""}
+            onChange={(v) => {
+              setFastModel(v || null);
+              setSaved(false);
+            }}
+            options={fastOptions}
+            searchable
+            disabled={!models}
+          />
+        </label>
+      </div>
+      <p className="lab -mt-1">
+        Small steps are quick background jobs (naming a session, checking a command). A cheaper, faster model is enough.
+      </p>
+
+      {keyedProviders.length > 0 && (
+        <AllowedModels value={allowedView} onChange={setAllowed} providers={keyedProviders} defaultModel={{ provider, id: model }} />
+      )}
+
+      {provider === "openai" && (
+        <p className="flex items-start gap-2 rounded-md bg-surface-2 px-3 py-2 text-[12.5px] text-ink-2">
+          <Info size={14} className="mt-0.5 shrink-0 text-ink-3" aria-hidden />
+          Forge&apos;s agent was designed for Claude. With ChatGPT it uses the same tools and checks, but web search isn&apos;t available to it, and costs on the
+          Usage page are estimates.
+        </p>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button type="button" className="btn btn-p btn-sm" disabled={!model || !changed || busy !== null || (needsKey && !apiKey.trim() && !hasKey)} onClick={() => void save()}>
+          <BusyLabel busy={busy === "save"} busyText={apiKey.trim() ? "Checking the key…" : "Saving…"}>
+            Save
+          </BusyLabel>
+        </button>
+        {saved && !changed && (
+          <span className="flex items-center gap-1.5 text-[13px] text-ok" role="status">
+            <CheckCircle2 size={14} aria-hidden />
+            Saved. New requests use {PROVIDERS.find((p) => p.id === status.provider)!.title}.
+          </span>
+        )}
+        {status.updatedBy && !saved && <span className="lab">Last changed by {status.updatedBy}</span>}
+      </div>
+    </Card>
   );
 }

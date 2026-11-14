@@ -1,4 +1,4 @@
-import { accessibleProjectIds, grantProject } from "../access.ts";
+import { accessibleProjectIds, atLeastProject, grantProject } from "../access.ts";
 import { applyTemplateToNewProject } from "../templates.ts";
 import {
   AnswerPauseInput,
@@ -9,6 +9,8 @@ import {
   StartRunInput,
   type Project,
   type SandboxStatus,
+  type StartRunResponse,
+  CreatePreviewShareInput,
 } from "@forge/protocol";
 import { ConnectionError, projectConnectionIds, setProjectConnections } from "../connections.ts";
 import { desc, eq } from "drizzle-orm";
@@ -21,6 +23,7 @@ import {
   answerPause,
   cancelRun,
   discardChanges,
+  isRunning,
   listChanges,
   PauseError,
   RunConflictError,
@@ -30,6 +33,10 @@ import {
 import { ensureSandbox, prepareStatus, previewUrl, sandboxState, stopSandbox } from "../sandbox.ts";
 import { GitHubError, importProject, openOrUpdatePullRequest } from "../github.ts";
 import { listVersions, restoreVersion, VersionError } from "../versions.ts";
+import { enqueue, hasQueued, listQueue, QueueError, removeQueued, runNext } from "../queue.ts";
+import { chatOnlyModel, projectModels } from "../ai.ts";
+import { suggestProjectName } from "../naming.ts";
+import { createShare, listShares, memberEnterUrl, revokeShare } from "../preview-access.ts";
 
 // Lowercase alphanumerics: project ids are used in preview hostnames.
 const newProjectId = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 12);
@@ -68,6 +75,7 @@ const toProject = (row: typeof schema.project.$inferSelect, ownerName?: string):
   prUrl: row.prUrl,
   autoQa: row.autoQa,
   autoQaDailyBudgetCents: row.autoQaDailyBudgetCents,
+  autonomous: row.autonomous,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
 });
@@ -107,6 +115,7 @@ export const projects = new Hono<AppEnv>()
       .values({
         id: newProjectId(),
         name: parsed.data.name,
+        nameAuto: Boolean(parsed.data.autoName),
         description: parsed.data.description ?? null,
         ownerId: c.get("user").id,
         templateId: templateId ?? null,
@@ -115,6 +124,8 @@ export const projects = new Hono<AppEnv>()
     // The creator manages the project.
     await grantProject(row!.id, c.get("user").id, "admin", c.get("user").id);
     if (templateId) await applyTemplateToNewProject(row!.id, templateId, { name: c.get("user").name });
+    // Named from the request: ask the AI for a better name in the background (naming.ts).
+    if (parsed.data.autoName && parsed.data.description) void suggestProjectName(row!.id, parsed.data.description).catch(() => undefined);
     return c.json({ ...toProject(row!, c.get("user").name), myRole: "admin" }, 201);
   })
   .post("/import", async (c) => {
@@ -132,10 +143,14 @@ export const projects = new Hono<AppEnv>()
   })
   .patch("/:id/settings", async (c) => {
     const parsed = ProjectSettingsInput.safeParse(await c.req.json().catch(() => null));
-    if (!parsed.success) return c.json({ error: "Daily budget must be between $0.10 and $50." }, 400);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      return c.json({ error: issue?.path[0] === "name" ? issue.message : "Daily budget must be between $0.10 and $50." }, 400);
+    }
     const [row] = await db
       .update(schema.project)
-      .set(parsed.data)
+      // A name someone typed is final: Forge won't replace it with a suggestion.
+      .set({ ...parsed.data, ...(parsed.data.name !== undefined ? { nameAuto: false } : {}) })
       .where(eq(schema.project.id, c.req.param("id")))
       .returning();
     if (!row) return c.json({ error: "not_found" }, 404);
@@ -191,14 +206,63 @@ export const projects = new Hono<AppEnv>()
     if (!(await projectExists(id))) return c.json({ error: "not_found" }, 404);
     const parsed = StartRunInput.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+    const user = c.get("user");
+    const who = { id: user.id, name: user.name };
+    // Chat-only models can't build: say so instead of failing halfway through the run.
+    if (parsed.data.mode !== "chat") {
+      const chatOnly = await chatOnlyModel(parsed.data.model);
+      if (chatOnly) return c.json({ error: `${chatOnly} can only chat. Switch to Chat mode, or pick a model that can code.` }, 400);
+    }
     try {
-      const user = c.get("user");
-      const runId = await startRun(id, parsed.data.prompt, { id: user.id, name: user.name }, parsed.data.mode);
-      return c.json({ runId }, 202);
+      // Busy, or others are already waiting: join the queue (queue.ts) so order is kept.
+      if (isRunning(id) || (await hasQueued(id))) {
+        return c.json({ queued: true, ...(await enqueue(id, parsed.data.prompt, parsed.data.mode, who, parsed.data.model)) } satisfies StartRunResponse, 202);
+      }
+      return c.json({ runId: await startRun(id, parsed.data.prompt, who, parsed.data.mode, parsed.data.model) } satisfies StartRunResponse, 202);
     } catch (err) {
-      if (err instanceof RunConflictError) return c.json({ error: err.message }, 409);
+      if (err instanceof RunConflictError) {
+        return c.json({ queued: true, ...(await enqueue(id, parsed.data.prompt, parsed.data.mode, who, parsed.data.model)) } satisfies StartRunResponse, 202);
+      }
+      if (err instanceof QueueError) return c.json({ error: err.message }, 429);
       throw err;
     }
+  })
+  // The prompt box's model picker: the models admins allow, and this project's current pick.
+  .get("/:id/models", async (c) => {
+    const [p] = await db.select({ lastModel: schema.project.lastModel }).from(schema.project).where(eq(schema.project.id, c.req.param("id")));
+    if (!p) return c.json({ error: "not_found" }, 404);
+    return c.json(await projectModels(p.lastModel));
+  })
+  // Preview access (preview-access.ts): an entry link for the builder's preview frame.
+  .get("/:id/preview-access", (c) => {
+    const compare = c.req.query("compare") === "1";
+    const next = c.req.query("next") ?? "/";
+    return c.json({ url: memberEnterUrl(c.req.param("id"), c.get("user").id, compare, next) });
+  })
+  // Share links: anyone with one can view the preview until it expires (builders manage them).
+  .get("/:id/preview-shares", async (c) => {
+    if (!atLeastProject(c.get("projectRole"), "builder")) return c.json({ error: "Only builders can see share links." }, 403);
+    return c.json({ shares: await listShares(c.req.param("id")) });
+  })
+  .post("/:id/preview-shares", async (c) => {
+    const parsed = CreatePreviewShareInput.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: "Choose how long the link should work." }, 400);
+    return c.json(await createShare(c.req.param("id"), parsed.data.duration, parsed.data.label, c.get("user").name), 201);
+  })
+  .delete("/:id/preview-shares/:sid", async (c) => {
+    const ok = await revokeShare(c.req.param("id"), c.req.param("sid"));
+    return ok ? c.json({ ok: true }) : c.json({ error: "That link was already turned off." }, 404);
+  })
+  // Messages waiting for the agent (queue.ts).
+  .get("/:id/queue", async (c) => c.json({ queue: await listQueue(c.req.param("id")) }))
+  .delete("/:id/queue/:qid", async (c) => {
+    const ok = await removeQueued(c.req.param("id"), c.req.param("qid"));
+    return ok ? c.json({ ok: true }) : c.json({ error: "That message already started or was removed." }, 404);
+  })
+  // After Stop the queue waits; this starts the next message.
+  .post("/:id/queue/next", async (c) => {
+    const runId = await runNext(c.req.param("id"));
+    return runId ? c.json({ runId }, 202) : c.json({ error: "The agent is busy or nothing is queued." }, 409);
   })
   .post("/:id/qa", async (c) => {
     const id = c.req.param("id");

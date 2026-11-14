@@ -1,3 +1,4 @@
+import { prettyRepoName } from "@forge/protocol";
 import type { GitHubStatus, ImportProjectInput, Project } from "@forge/protocol";
 import { createOrgRepo, githubInstallationToken, IntegrationError } from "./integrations.ts";
 import { scanProject } from "./security.ts";
@@ -159,7 +160,7 @@ export async function importProject(input: ImportProjectInput, user: { id: strin
       .insert(schema.project)
       .values({
         id,
-        name: input.name || meta.name,
+        name: input.name || prettyRepoName(meta.name),
         description: meta.description,
         ownerId: user.id,
         source: "github",

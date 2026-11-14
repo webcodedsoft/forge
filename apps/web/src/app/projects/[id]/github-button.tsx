@@ -52,7 +52,7 @@ export function GitHubButton({
 
   useEffect(() => {
     if (!open) return;
-    const close = (e: MouseEvent) => box.current && !box.current.contains(e.target as Node) && phase !== "checking" && setOpen(false);
+    const close = (e: MouseEvent) => box.current && !e.composedPath().includes(box.current) && phase !== "checking" && setOpen(false);
     const key = (e: KeyboardEvent) => e.key === "Escape" && phase !== "checking" && setOpen(false);
     document.addEventListener("mousedown", close);
     document.addEventListener("keydown", key);

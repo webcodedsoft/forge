@@ -81,7 +81,7 @@ export function ViewportPicker({ actual, scale }: { actual: { width: number; hei
   useEffect(() => {
     if (!open) return;
     const close = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+      if (box.current && !e.composedPath().includes(box.current)) setOpen(false);
     };
     const closeOnBlur = () => setTimeout(() => document.activeElement?.tagName === "IFRAME" && setOpen(false), 0);
     document.addEventListener("mousedown", close);

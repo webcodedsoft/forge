@@ -1,13 +1,16 @@
 "use client";
 
+import { deriveProjectName, prettyRepoName } from "@forge/protocol";
 import type { ActivityResponse, GitHubRepo, GitHubReposResponse, Project, ProjectTemplate } from "@forge/protocol";
-import { ArrowRight, GitBranch, Globe, LayoutTemplate, Lock, Search, Sparkles } from "lucide-react";
+import { Select } from "@/components/select";
+import { ArrowRight, GitBranch, Globe, LayoutTemplate, Lock, Paperclip, Search, Sparkles, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useState, useSyncExternalStore } from "react";
 import { Pagination, usePagination } from "@/components/pagination";
 import { BusyLabel, Skeleton, SkeletonRows } from "@/components/loading";
 import { Modal, ModalActions } from "@/components/modal";
+import { ATTACH_ACCEPT, type Attachment, AttachmentIcon, attachmentProblem, attachmentSuffix, uploadFiles } from "@/lib/uploads";
 import { Avatar, ProjectBadge } from "@/components/project-badge";
 import { api } from "@/lib/api";
 import { useSession } from "@/lib/auth-client";
@@ -38,11 +41,6 @@ const IDEAS = [
 ];
 
 /** A project name from the first words of the idea. */
-const nameFrom = (idea: string) => {
-  const words = idea.replace(/[^\p{L}\p{N}\s-]/gu, " ").trim().split(/\s+/).filter((w) => !/^(a|an|the)$/i.test(w)).slice(0, 4);
-  const n = words.join(" ");
-  return n ? n[0]!.toUpperCase() + n.slice(1) : "New app";
-};
 
 /** Prompt-first start: describe the app; Forge creates the project and starts building it. */
 function StartApp({ templates }: { templates: ProjectTemplate[] }) {
@@ -53,26 +51,51 @@ function StartApp({ templates }: { templates: ProjectTemplate[] }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  // Files wait here until the project exists; then they're uploaded and attached to the first request.
+  const [files, setFiles] = useState<File[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [stage, setStage] = useState<string | null>(null);
+  const fileInput = useId();
   const tpl = templates.find((t) => t.id === templateId) ?? null;
 
+  function addFiles(list: FileList | File[]) {
+    const next = Array.from(list);
+    const problem = attachmentProblem(next, files.length);
+    if (problem) return setError(problem);
+    setError(null);
+    setFiles((cur) => [...cur, ...next.filter((n) => !cur.some((c) => c.name === n.name && c.size === n.size))]);
+  }
+
   async function submit() {
-    if (!idea.trim() && !tpl) return setError("Describe what to build, or pick a template to start from.");
+    if (!idea.trim() && !tpl && !files.length) return setError("Describe what to build, attach files, or pick a template to start from.");
     setBusy(true);
     setError(null);
     try {
+      setStage("Creating the project…");
+      const first = idea.trim() || (files.length ? "Build the app described in the attached files." : "");
       const p = await api.createProject({
-        name: name.trim() || (idea.trim() ? nameFrom(idea) : tpl!.name),
-        description: idea.trim() || undefined,
+        // A typed name is kept. Otherwise Forge names it from the request right away, then the AI
+        // may suggest a better name in the background (autoName).
+        name: name.trim() || (idea.trim() ? deriveProjectName(idea) : files[0] ? prettyRepoName(files[0].name.replace(/\.[^.]+$/, "")) : tpl!.name),
+        autoName: !name.trim() && Boolean(idea.trim()),
+        description: first || undefined,
         templateId: tpl?.id,
       });
+      let attached: Attachment[] = [];
+      if (files.length) {
+        setStage(`Uploading ${files.length} file${files.length === 1 ? "" : "s"}…`);
+        attached = await uploadFiles(p.id, files);
+      }
       // The idea is the first request: the agent starts on it while the builder opens.
-      if (idea.trim()) await api.startRun(p.id, idea.trim()).catch(() => undefined);
+      if (first) await api.startRun(p.id, first + attachmentSuffix(attached)).catch(() => undefined);
       setIdea("");
       setName("");
+      setFiles([]);
       router.push(`/projects/${p.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
+      setStage(null);
     }
   }
 
@@ -91,7 +114,28 @@ function StartApp({ templates }: { templates: ProjectTemplate[] }) {
           <Sparkles size={17} className="text-primary" aria-hidden />
           What do you want to build?
         </label>
-        <div className="overflow-hidden rounded-xl border border-line-2 bg-paper shadow-sm transition-[border-color,box-shadow] focus-within:border-primary focus-within:shadow-[0_0_0_4px_var(--primary-ring)]">
+        <div
+          className={`relative overflow-hidden rounded-xl border bg-paper shadow-sm transition-[border-color,box-shadow] focus-within:border-primary focus-within:shadow-[0_0_0_4px_var(--primary-ring)] ${dragging ? "border-primary" : "border-line-2"}`}
+          onDragOver={(e) => {
+            if (!e.dataTransfer.types.includes("Files")) return;
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false);
+          }}
+          onDrop={(e) => {
+            if (!e.dataTransfer.files.length) return;
+            e.preventDefault();
+            setDragging(false);
+            addFiles(e.dataTransfer.files);
+          }}
+        >
+          {dragging && (
+            <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-surface/85 text-[14px] font-semibold text-primary">
+              Drop images, PDFs or documents to attach them
+            </div>
+          )}
           <textarea
             id="idea"
             data-gramm="false"
@@ -104,28 +148,63 @@ function StartApp({ templates }: { templates: ProjectTemplate[] }) {
             onKeyDown={(e) => {
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submit();
             }}
+            onPaste={(e) => {
+              if (e.clipboardData.files.length) {
+                e.preventDefault();
+                addFiles(e.clipboardData.files);
+              }
+            }}
             maxLength={2000}
           />
+          {files.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5 px-3 pb-2.5" aria-label="Attached files">
+              {files.map((f) => (
+                <li key={`${f.name}-${f.size}`} className="pill gap-1.5 bg-surface-2 py-1 pr-1 text-ink">
+                  <AttachmentIcon name={f.name} type={f.type} />
+                  <span className="max-w-48 truncate">{f.name}</span>
+                  <span className="text-ink-3">{f.size < 1024 * 1024 ? `${Math.max(1, Math.round(f.size / 1024))} KB` : `${(f.size / 1024 / 1024).toFixed(1)} MB`}</span>
+                  <button type="button" className="rounded p-0.5 hover:bg-surface" aria-label={`Remove ${f.name}`} onClick={() => setFiles((cur) => cur.filter((x) => x !== f))} disabled={busy}>
+                    <X size={12} aria-hidden />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
           <div className="flex flex-wrap items-center gap-2 border-t border-line bg-surface/60 px-3 py-2.5">
-            <label className="flex h-9 items-center gap-1.5 rounded-lg border border-line-2 bg-surface pl-2.5 text-[13px] text-ink-2 focus-within:border-primary">
-              <LayoutTemplate size={14} aria-hidden />
-              <span className="sr-only">Start from</span>
-              <select className="h-full max-w-52 cursor-pointer rounded-lg bg-transparent pr-2 text-[13px] text-ink outline-none focus-visible:shadow-none" value={templateId} onChange={(e) => setTemplateId(e.target.value)} aria-label="Start from">
-                <option value="">Blank app</option>
-                {templates.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    Template: {t.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <Select
+              ariaLabel="Start from"
+              className="w-52"
+              menuWidth="20rem"
+              value={templateId}
+              onChange={setTemplateId}
+              options={[
+                { value: "", label: "Blank app", hint: "Start from Forge's clean starter", icon: <Sparkles size={14} /> },
+                ...templates.map((t) => ({ value: t.id, label: t.name, hint: t.description ?? `Team template, saved by ${t.createdBy}`, icon: <LayoutTemplate size={14} /> })),
+              ]}
+            />
             <input
               className="in h-9 w-48 rounded-lg py-0 text-[13px]"
-              placeholder={idea.trim() ? nameFrom(idea) : "Project name (optional)"}
+              placeholder={idea.trim() ? deriveProjectName(idea) : "Project name (optional)"}
+              title="Leave empty and Forge names the project from your request"
               value={name}
               onChange={(e) => setName(e.target.value)}
               aria-label="Project name"
               maxLength={80}
+            />
+            <label htmlFor={fileInput} className="btn btn-g h-9 cursor-pointer px-3 text-[13px]" data-tip="Images, PDFs, Word, Excel, PowerPoint or text files (up to 20 MB each)">
+              <Paperclip size={14} aria-hidden />
+              Attach
+            </label>
+            <input
+              id={fileInput}
+              type="file"
+              multiple
+              accept={ATTACH_ACCEPT}
+              className="sr-only"
+              onChange={(e) => {
+                if (e.target.files?.length) addFiles(e.target.files);
+                e.target.value = "";
+              }}
             />
             <button type="button" className="btn btn-g h-9 px-3 text-[13px]" onClick={() => setImporting(true)}>
               <GitBranch size={14} aria-hidden />
@@ -135,9 +214,9 @@ function StartApp({ templates }: { templates: ProjectTemplate[] }) {
               type="submit"
               className="btn btn-p ml-auto h-9 gap-2 rounded-lg px-4 text-[13.5px] font-semibold shadow-[0_4px_14px_var(--primary-ring)] disabled:shadow-none"
               aria-busy={busy}
-              disabled={!idea.trim() && !tpl}
+              disabled={!idea.trim() && !tpl && !files.length}
             >
-              <BusyLabel busy={busy} busyText="Starting…">
+              <BusyLabel busy={busy} busyText={stage ?? "Starting…"}>
                 Build it <ArrowRight size={15} aria-hidden />
               </BusyLabel>
             </button>
@@ -168,7 +247,7 @@ function StartApp({ templates }: { templates: ProjectTemplate[] }) {
         <p className="lab flex items-center gap-1.5">
           <kbd className="rounded border border-line-2 px-1 font-mono text-[11px]">⌘</kbd>
           <kbd className="rounded border border-line-2 px-1 font-mono text-[11px]">↵</kbd>
-          builds it. You can keep refining in the builder.
+          builds it. Drop in a brief, mockups or data files and the agent works from them. You can keep refining in the builder.
         </p>
       </form>
       <ImportModal open={importing} onClose={() => setImporting(false)} />
@@ -282,17 +361,22 @@ function ImportModal({ open, onClose }: { open: boolean; onClose: () => void }) 
                 </button>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <label className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5">
                   <span className="lab">Branch</span>
-                  <select className="in" value={branch || picked.defaultBranch} onChange={(e) => setBranch(e.target.value)} disabled={branches === null}>
-                    {(branches ?? [picked.defaultBranch]).map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                        {b === picked.defaultBranch ? " (default)" : ""}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                  <Select
+                    ariaLabel="Branch"
+                    searchable
+                    disabled={branches === null}
+                    value={branch || picked.defaultBranch}
+                    onChange={setBranch}
+                    options={(branches ?? [picked.defaultBranch]).map((b) => ({
+                      value: b,
+                      label: b,
+                      hint: b === picked.defaultBranch ? "Default branch" : undefined,
+                      icon: <GitBranch size={14} />,
+                    }))}
+                  />
+                </div>
                 <label className="flex flex-col gap-1.5">
                   <span className="lab">Project name (optional)</span>
                   <input className="in" value={name} onChange={(e) => setName(e.target.value)} placeholder={picked.fullName.split("/")[1]} maxLength={80} />

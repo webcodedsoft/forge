@@ -8,6 +8,7 @@ import { signOut, useSession } from "@/lib/auth-client";
 import { isAdmin, useMe } from "@/lib/me";
 import { useOpenProjects } from "@/lib/open-projects";
 import { CommandPalette } from "./command-palette";
+import { ForgeMark } from "./forge-mark";
 import { Avatar, ProjectBadge } from "./project-badge";
 import { ThemeToggle } from "./theme-toggle";
 
@@ -67,10 +68,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   // The page always renders (its own data calls handle sign-in); only the account menu waits.
   return (
-    <div className="flex min-h-dvh flex-col">
-      <header className="flex flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-2.5">
+    // Desktop: the frame fills the window; the header and sidebar stay put and only the content
+    // scrolls. Phones: the sidebar sits above the content, so the page scrolls and the header sticks.
+    <div className="flex min-h-dvh flex-col md:h-dvh md:min-h-0 md:overflow-hidden">
+      <header className="sticky top-0 z-30 flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-2.5 md:static">
         <Link href="/" className="flex items-center gap-2 text-base font-bold">
-          <span className="flex size-7 items-center justify-center rounded-md bg-primary text-[13px] text-primary-fg">F</span>
+          <ForgeMark size={28} />
           Forge
         </Link>
         <div className="ml-3 flex flex-1">
@@ -109,7 +112,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        <nav aria-label="Main" className="flex shrink-0 flex-col gap-0.5 border-line bg-surface p-3 md:w-56 md:border-r">
+        <nav aria-label="Main" className="flex shrink-0 flex-col gap-0.5 border-line bg-surface p-3 md:w-56 md:overflow-y-auto md:border-r">
           <Suspense fallback={<MainLinks admin={isAdmin(me)} />}>
             <MainLinks admin={isAdmin(me)} current />
           </Suspense>
@@ -125,7 +128,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </>
           )}
         </nav>
-        <div className="min-w-0 flex-1">{children}</div>
+        <div id="main-scroll" className="flex min-w-0 flex-1 flex-col md:min-h-0 md:overflow-y-auto">
+          {children}
+        </div>
       </div>
     </div>
   );

@@ -8,6 +8,7 @@ import {
   Ban,
   Check,
   Copy,
+  Eye,
   Hammer,
   Link2,
   Mail,
@@ -18,7 +19,8 @@ import {
   Users,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { Avatar } from "@/components/project-badge";
+import { Avatar, ProjectBadge } from "@/components/project-badge";
+import { Select } from "@/components/select";
 import { api } from "@/lib/api";
 import { isAdmin, useMe } from "@/lib/me";
 import { Pagination, usePagination } from "@/components/pagination";
@@ -194,27 +196,34 @@ export default function TeamPage() {
             </fieldset>
             {role !== "admin" && (
               <div className="grid gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-                <label className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5">
                   <span className="lab">Also add to a project (optional)</span>
-                  <select className="in" value={projectId} onChange={(e) => setProjectId(e.target.value)}>
-                    <option value="">No project</option>
-                    {projects.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="flex flex-col gap-1.5">
+                  <Select
+                    ariaLabel="Also add to a project"
+                    searchable
+                    value={projectId}
+                    onChange={setProjectId}
+                    options={[
+                      { value: "", label: "No project" },
+                      ...projects.map((p) => ({ value: p.id, label: p.name, icon: <ProjectBadge id={p.id} name={p.name} size={16} /> })),
+                    ]}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
                   <span className="lab">Project role</span>
-                  <select className="in" value={projectRole} disabled={!projectId} onChange={(e) => setProjectRole(e.target.value as ProjectRole)}>
-                    {PROJECT_ROLES.map((r) => (
-                      <option key={r.id} value={r.id}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                  <Select
+                    ariaLabel="Project role"
+                    disabled={!projectId}
+                    value={projectRole}
+                    onChange={setProjectRole}
+                    menuWidth="16rem"
+                    options={PROJECT_ROLES.map((r) => ({
+                      value: r.id,
+                      label: r.label,
+                      icon: r.id === "admin" ? <ShieldCheck size={14} /> : r.id === "builder" ? <Hammer size={14} /> : <Eye size={14} />,
+                    }))}
+                  />
+                </div>
               </div>
             )}
             <ModalActions>
@@ -285,18 +294,19 @@ export default function TeamPage() {
                   </span>
                 </span>
                 <span className="w-36">
-                  <select
-                    className="in h-8 w-full py-0 text-[13px]"
-                    aria-label={`Role of ${m.name}`}
+                  <Select
+                    ariaLabel={`Role of ${m.name}`}
+                    size="sm"
+                    menuWidth="19rem"
                     value={m.role}
-                    onChange={(e) => act(() => api.setMemberRole(m.id, e.target.value as WorkspaceRole))}
-                  >
-                    {WS_ROLES.map((r) => (
-                      <option key={r.id} value={r.id}>
-                        {r.label}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={(r: WorkspaceRole) => act(() => api.setMemberRole(m.id, r))}
+                    options={WS_ROLES.map((r) => ({
+                      value: r.id,
+                      label: r.label,
+                      hint: r.help,
+                      icon: r.id === "admin" ? <ShieldCheck size={14} /> : r.id === "builder" ? <Hammer size={14} /> : <User size={14} />,
+                    }))}
+                  />
                 </span>
                 <span className="w-24 text-ink-2">{m.role === "admin" ? "All" : m.projects}</span>
                 <span className="lab w-28">{new Date(m.joinedAt).toLocaleDateString()}</span>

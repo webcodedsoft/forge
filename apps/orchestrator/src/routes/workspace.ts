@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { MAX_UPLOAD_BYTES, saveUpload, UploadError } from "../uploads.ts";
 import { FigmaError, importFigmaFrame } from "../figma.ts";
 import { z } from "zod";
 import type { AppEnv } from "../index.ts";
@@ -13,8 +14,6 @@ import { ensureSandbox, exec, putFiles, restartDevServer } from "../sandbox.ts";
 
 const MAX_FILES = 5000;
 const MAX_VIEW_BYTES = 512 * 1024;
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const UPLOAD_TYPES = /^(image\/(png|jpe?g|gif|webp)|application\/pdf|text\/[\w.+-]+|application\/json)$/;
 
 /** Runs inside the project container with the checks' Playwright and Chromium; prints a base64 PNG. */
 const SCREENSHOT_SCRIPT = `
@@ -78,26 +77,38 @@ export const workspace = new Hono<AppEnv>()
     const binary = r.stdout.slice(0, 8000).includes("\u0000") || r.stdout.includes("�");
     return c.json({ path, size, binary, content: binary ? null : r.stdout });
   })
-  // Attach a file to the next request: saved in .forge/uploads/ (git-excluded) for the agent to read.
+  // Attach a file to the next request (uploads.ts): images, PDFs, Office files, text.
   .post("/:id/uploads", async (c) => {
-    const id = c.req.param("id");
     const parsed = z
-      .object({ name: z.string().min(1).max(200), type: z.string().max(100), dataBase64: z.string().max(Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 8) })
+      .object({ name: z.string().min(1).max(200), type: z.string().max(200), dataBase64: z.string().max(Math.ceil((MAX_UPLOAD_BYTES * 4) / 3) + 8) })
       .safeParse(await c.req.json().catch(() => null));
-    if (!parsed.success) return c.json({ error: "Files can be up to 10 MB." }, 400);
-    if (!UPLOAD_TYPES.test(parsed.data.type)) return c.json({ error: "Attach images (PNG, JPG, GIF, WebP), PDFs or text files." }, 400);
-    const data = Buffer.from(parsed.data.dataBase64, "base64");
-    if (data.length > MAX_UPLOAD_BYTES) return c.json({ error: "Files can be up to 10 MB." }, 400);
-    const clean = parsed.data.name.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(-80) || "file";
-    const path = `.forge/uploads/${Date.now().toString(36)}-${clean}`;
+    if (!parsed.success) return c.json({ error: "Files can be up to 20 MB." }, 400);
+    try {
+      return c.json(await saveUpload(c.req.param("id"), parsed.data.name, parsed.data.type, Buffer.from(parsed.data.dataBase64, "base64")), 201);
+    } catch (err) {
+      if (err instanceof UploadError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  })
+  // An attached image, for thumbnails in the feed. Only images in .forge/uploads/.
+  .get("/:id/uploads/file", async (c) => {
+    const id = c.req.param("id");
+    const path = c.req.query("path") ?? "";
+    const m = /^\.forge\/uploads\/[a-z0-9]+-[\w.-]+\.(png|jpe?g|gif|webp|svg)$/i.exec(path);
+    if (!m || !safePath(path)) return c.json({ error: "not_found" }, 404);
     await ensureSandbox(id);
-    await exec(id, [
-      "sh",
-      "-c",
-      "mkdir -p .git/info && (grep -qx '.forge/uploads/' .git/info/exclude 2>/dev/null || echo '.forge/uploads/' >> .git/info/exclude)",
-    ]);
-    await putFiles(id, [{ path, content: data }]);
-    return c.json({ path, name: parsed.data.name, size: data.length, type: parsed.data.type }, 201);
+    const r = await exec(id, ["sh", "-c", 'test -f "$1" && test "$(stat -c %s "$1")" -le $2 && base64 -w0 "$1"', "sh", path, String(MAX_UPLOAD_BYTES)]);
+    if (r.exitCode !== 0 || !r.stdout) return c.json({ error: "not_found" }, 404);
+    const ext = m[1]!.toLowerCase();
+    const type = ext === "svg" ? "image/svg+xml" : ext === "jpg" || ext === "jpeg" ? "image/jpeg" : `image/${ext}`;
+    return c.body(Buffer.from(r.stdout.trim(), "base64"), 200, {
+      "Content-Type": type,
+      // Upload paths include a timestamp, so the file at a path never changes.
+      "Cache-Control": "private, max-age=86400, immutable",
+      "X-Content-Type-Options": "nosniff",
+      // An SVG opened on its own can't run scripts.
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    });
   })
   // Figma → app: import a frame (image + spec) as attachments for the next request.
   .post("/:id/figma", async (c) => {

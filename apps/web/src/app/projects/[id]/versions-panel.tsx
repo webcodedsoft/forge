@@ -1,6 +1,7 @@
 "use client";
 
 import type { BranchesResponse, Version } from "@forge/protocol";
+import { Select } from "@/components/select";
 import { GitBranch, GitCompare, Lightbulb, RotateCcw, Trash2, LayoutTemplate } from "lucide-react";
 import { useEffect, useState } from "react";
 import { BusyLabel, SkeletonCards } from "@/components/loading";
@@ -71,22 +72,24 @@ export function VersionsPanel({
     <div className="p-4 text-sm">
       {lines && (ideas.length > 0 || onIdea) && (
         <section className="card mb-3 p-3" aria-label="Lines of work">
-          <label className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <GitBranch size={15} className="text-ink-3" aria-hidden />
             <span className="lab">Working on</span>
-            <select
-              className="in h-8 min-w-0 flex-1 py-0 text-[13px]"
+            <Select
+              ariaLabel="Line of work"
+              size="sm"
+              className="min-w-0 flex-1"
               value={lines.current}
               disabled={disabled || busy !== null}
-              onChange={(e) => void act("switch", () => api.switchBranch(projectId, e.target.value))}
-            >
-              {lines.branches.map((b) => (
-                <option key={b.name} value={b.name}>
-                  {b.main ? "Main line" : `Idea: ${b.name}`}
-                </option>
-              ))}
-            </select>
-          </label>
+              onChange={(name) => void act("switch", () => api.switchBranch(projectId, name))}
+              options={lines.branches.map((b) => ({
+                value: b.name,
+                label: b.main ? "Main line" : b.name,
+                hint: b.main ? "The app as the team uses it" : "An idea, separate from the main line",
+                icon: b.main ? <GitBranch size={14} /> : <Lightbulb size={14} />,
+              }))}
+            />
+          </div>
           {onIdea && (
             <div className="mt-2.5 flex flex-col gap-2 rounded-md bg-primary-weak px-3 py-2.5 text-[13px]">
               <p>

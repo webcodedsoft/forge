@@ -1,4 +1,4 @@
-import type { CreateConnectionRequest, UpdateConnectionInput } from "@forge/protocol";
+import type { AiModel, AiProvider, CreateConnectionRequest, PreviewShare, PreviewShareDuration, ProjectModels, QueuedMessage, StartRunResponse, UpdateAiSettingsInput, UpdateConnectionInput } from "@forge/protocol";
 import type {
   AnswerPauseInput,
   ApiConnectionDetails,
@@ -90,10 +90,24 @@ export const api = {
   sandbox: (id: string) => request<SandboxStatus>(`/projects/${encodeURIComponent(id)}/sandbox`),
   startSandbox: (id: string) =>
     request<SandboxStatus>(`/projects/${encodeURIComponent(id)}/sandbox/start`, { method: "POST" }),
-  startRun: (id: string, prompt: string, mode: RunMode = "build") =>
-    request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/runs`, {
+  queue: (id: string) => request<{ queue: QueuedMessage[] }>(`/projects/${encodeURIComponent(id)}/queue`).then((r) => r.queue),
+  removeQueued: (id: string, qid: string) =>
+    request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/queue/${encodeURIComponent(qid)}`, { method: "DELETE" }),
+  runNextQueued: (id: string) => request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/queue/next`, { method: "POST" }),
+  previewAccess: (id: string, opts: { compare?: boolean; next?: string } = {}) =>
+    request<{ url: string }>(
+      `/projects/${encodeURIComponent(id)}/preview-access?${new URLSearchParams({ ...(opts.compare ? { compare: "1" } : {}), next: opts.next ?? "/" })}`,
+    ),
+  previewShares: (id: string) => request<{ shares: PreviewShare[] }>(`/projects/${encodeURIComponent(id)}/preview-shares`).then((r) => r.shares),
+  createPreviewShare: (id: string, input: { duration: PreviewShareDuration; label?: string }) =>
+    request<PreviewShare>(`/projects/${encodeURIComponent(id)}/preview-shares`, { method: "POST", body: JSON.stringify(input) }),
+  revokePreviewShare: (id: string, sid: string) =>
+    request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/preview-shares/${encodeURIComponent(sid)}`, { method: "DELETE" }),
+  projectModels: (id: string) => request<ProjectModels>(`/projects/${encodeURIComponent(id)}/models`),
+  startRun: (id: string, prompt: string, mode: RunMode = "build", model?: string) =>
+    request<StartRunResponse>(`/projects/${encodeURIComponent(id)}/runs`, {
       method: "POST",
-      body: JSON.stringify({ prompt, mode }),
+      body: JSON.stringify(model ? { prompt, mode, model } : { prompt, mode }),
     }),
   files: (id: string) => request<{ files: string[] }>(`/projects/${encodeURIComponent(id)}/files`),
   fileContent: (id: string, path: string) =>
@@ -144,6 +158,13 @@ export const api = {
   disconnectGitHub: (forgetApp = false) => request<{ ok: true }>(`/integrations/github${forgetApp ? "?forget=app" : ""}`, { method: "DELETE" }),
   setFigmaToken: (token: string) => request<{ ok: true }>("/integrations/figma", { method: "PUT", body: JSON.stringify({ token }) }),
   removeFigmaToken: () => request<{ ok: true }>("/integrations/figma", { method: "DELETE" }),
+  aiModels: (provider: AiProvider, apiKey?: string) =>
+    request<{ models: AiModel[]; source: "api" | "builtin" }>("/integrations/ai/models", {
+      method: "POST",
+      body: JSON.stringify(apiKey ? { provider, apiKey } : { provider }),
+    }),
+  updateAi: (input: UpdateAiSettingsInput) => request<{ ok: true }>("/integrations/ai", { method: "PUT", body: JSON.stringify(input) }),
+  removeAiKey: (provider: AiProvider) => request<{ ok: true }>(`/integrations/ai/keys/${provider}`, { method: "DELETE" }),
   team: () => request<{ members: TeamMember[]; invitations: Invitation[] }>("/team"),
   invite: (input: Partial<CreateInvitationInput> & { email: string }) =>
     request<Invitation>("/team/invitations", { method: "POST", body: JSON.stringify(input) }),
@@ -193,7 +214,7 @@ export const api = {
   listComments: (id: string) => request<ProjectComment[]>(`/projects/${encodeURIComponent(id)}/comments`),
   createComment: (id: string, input: CreateCommentInput) =>
     request<{ id: string }>(`/projects/${encodeURIComponent(id)}/comments`, { method: "POST", body: JSON.stringify(input) }),
-  updateComment: (id: string, commentId: string, input: { resolved?: boolean; body?: string }) =>
+  updateComment: (id: string, commentId: string, input: { resolved?: boolean; body?: string; selector?: string }) =>
     request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/comments/${encodeURIComponent(commentId)}`, {
       method: "PATCH",
       body: JSON.stringify(input),

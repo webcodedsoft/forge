@@ -10,6 +10,9 @@ import type { Server } from "node:http";
 import { seedFromClone } from "./github.ts";
 import { startPreviewProxy } from "./preview.ts";
 import { startModelProxy } from "./model-proxy.ts";
+import { aiReady } from "./ai.ts";
+import { recoverInterruptedRuns } from "./runs.ts";
+import { describeShare } from "./preview-access.ts";
 import { setImportSeeder } from "./sandbox.ts";
 import { brain } from "./routes/brain.ts";
 import { connections } from "./routes/connections.ts";
@@ -56,6 +59,15 @@ app.get("/api/health", async (c) => {
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
 // Public: whether the first (admin) account still needs to be created, and invitation previews.
+// Preview share links (preview-access.ts): the public page /preview/<projectId>/<token> in the web
+// app asks what a link opens. Public: the token is the access.
+app.get("/api/public/preview-shares/:projectId/:token", async (c) => {
+  const { projectId, token } = c.req.param();
+  c.header("cache-control", "no-store");
+  if (!/^[a-z0-9]{6,32}$/.test(projectId) || !/^[A-Za-z0-9_-]{20,64}$/.test(token)) return c.json({ error: "invalid" }, 404);
+  const share = await describeShare(projectId, token);
+  return share ? c.json(share) : c.json({ error: "expired" }, 404);
+});
 app.route("/api/setup", setup);
 app.route("/api/invitations", publicInvitations);
 
@@ -138,11 +150,14 @@ app.get("/api/me", (c) => {
 
 const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: env.ORCHESTRATOR_PORT }, (info) => {
   console.log(`orchestrator listening on http://127.0.0.1:${info.port}`);
-  if (!env.ANTHROPIC_API_KEY) console.warn("ANTHROPIC_API_KEY is not set: agent runs will fail until it is added to .env");
+  void aiReady().then((ok) => {
+    if (!ok) console.warn("The chosen AI has no API key: add one in Settings › Integrations › AI model (or ANTHROPIC_API_KEY / OPENAI_API_KEY in .env).");
+  });
 });
 attachWebSocket(server as Server);
 setImportSeeder(seedFromClone);
 startPreviewProxy();
 startModelProxy();
+void recoverInterruptedRuns().catch((e) => console.error("could not close interrupted runs", e));
 startServerLogWatcher();
 startDataProxy();

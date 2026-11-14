@@ -11,6 +11,9 @@ import {
   removeIntegration,
   setFigmaToken,
 } from "../integrations.ts";
+import { listModels, removeAiKey, updateAiSettings } from "../ai.ts";
+
+const Provider = z.enum(["anthropic", "openai"]);
 
 /* Settings › Integrations. Workspace admins only (index.ts). GitHub's redirects come back here too. */
 const back = (q: string) => `/settings/integrations?${q}`;
@@ -64,6 +67,60 @@ export const integrations = new Hono<AppEnv>()
       if (err instanceof IntegrationError) return c.json({ error: err.message }, 400);
       throw err;
     }
+  })
+  // AI model: which AI builds the apps (ai.ts).
+  // POST, so a key being added (to list its models before saving) stays out of the URL and logs.
+  .post("/ai/models", async (c) => {
+    const body = z
+      .object({ provider: Provider, apiKey: z.string().trim().max(400).optional() })
+      .safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: "Choose Claude or ChatGPT." }, 400);
+    try {
+      return c.json(await listModels(body.data.provider, body.data.apiKey || undefined));
+    } catch (err) {
+      if (err instanceof IntegrationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  })
+  .put("/ai", async (c) => {
+    const body = z
+      .object({
+        provider: Provider,
+        model: z.string().trim().min(1).max(120),
+        fastModel: z.string().trim().max(120).nullable().optional(),
+        apiKey: z.string().trim().min(20).max(400).optional(),
+        allowed: z
+          .array(
+            z.object({
+              provider: Provider,
+              id: z.string().trim().min(1).max(120),
+              label: z.string().max(60),
+              hint: z.string().max(80),
+              cost: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+              price: z
+                .object({ input: z.number().min(0).max(10000), cachedInput: z.number().min(0).max(10000), output: z.number().min(0).max(10000) })
+                .nullable()
+                .optional(),
+            }),
+          )
+          .max(24)
+          .optional(),
+      })
+      .safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: "Choose an AI and a model." }, 400);
+    try {
+      await updateAiSettings(body.data, c.get("user").name);
+      return c.json({ ok: true });
+    } catch (err) {
+      if (err instanceof IntegrationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  })
+  .delete("/ai/keys/:provider", async (c) => {
+    const p = Provider.safeParse(c.req.param("provider"));
+    if (!p.success) return c.json({ error: "Unknown provider." }, 400);
+    await removeAiKey(p.data, c.get("user").name);
+    return c.json({ ok: true });
   })
   .delete("/figma", async (c) => {
     await removeIntegration("figma");

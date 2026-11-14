@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { db, schema } from "./db/index.ts";
 import { env } from "./env.ts";
 import { decrypt, encrypt } from "./secrets.ts";
+import { aiSettings } from "./ai.ts";
 
 /*
  * Settings › Integrations (workspace admins).
@@ -36,7 +37,7 @@ type GitHubSecret = { pem: string; clientSecret?: string; webhookSecret?: string
 
 const AAD = (key: string) => `integration/${key}`;
 
-async function load<C, S>(key: string): Promise<{ config: C; secret: S | null; updatedBy: string; updatedAt: Date } | null> {
+export async function load<C, S>(key: string): Promise<{ config: C; secret: S | null; updatedBy: string; updatedAt: Date } | null> {
   const [row] = await db.select().from(schema.integration).where(eq(schema.integration.key, key));
   if (!row) return null;
   return {
@@ -47,7 +48,7 @@ async function load<C, S>(key: string): Promise<{ config: C; secret: S | null; u
   };
 }
 
-async function save(key: string, config: object, secret: object | null, by: string) {
+export async function save(key: string, config: object, secret: object | null, by: string) {
   const enc = secret ? encrypt(JSON.stringify(secret), AAD(key)) : null;
   await db
     .insert(schema.integration)
@@ -75,7 +76,11 @@ export async function removeIntegration(key: "github" | "figma") {
 /* --------------------------------- status -------------------------------- */
 
 export async function integrationsStatus(): Promise<IntegrationsStatus> {
-  const [gh, fig] = await Promise.all([load<GitHubConfig, GitHubSecret>("github"), load<{ user?: string }, { token: string }>("figma")]);
+  const [gh, fig, ai] = await Promise.all([
+    load<GitHubConfig, GitHubSecret>("github"),
+    load<{ user?: string }, { token: string }>("figma"),
+    aiSettings(),
+  ]);
   return {
     github: gh
       ? {
@@ -92,6 +97,7 @@ export async function integrationsStatus(): Promise<IntegrationsStatus> {
         }
       : { state: "not_connected" },
     figma: fig ? { configured: true, user: fig.config.user ?? null, updatedBy: fig.updatedBy, updatedAt: fig.updatedAt.toISOString() } : { configured: false },
+    ai,
   };
 }
 
