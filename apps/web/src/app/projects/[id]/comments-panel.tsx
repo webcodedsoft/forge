@@ -211,8 +211,14 @@ function ThreadCard({
       {[thread, ...thread.replies].map((c) => (
         <div key={c.id} className="mt-2">
           <p className="text-xs">
-            <span className="font-medium">{c.userName}</span> <span className="text-ink-3">{when(c.createdAt)}</span>
-            {c.userId === meId && (
+            <span className="font-medium">{c.userName}</span>
+            {c.guest && (
+              <span className="pill pill-pri ml-1.5 text-[10.5px]" title={c.via ? `Left through the share link “${c.via}”` : "Left through a preview share link"}>
+                Guest
+              </span>
+            )}{" "}
+            <span className="text-ink-3">{when(c.createdAt)}</span>
+            {((meId && c.userId === meId) || (c.guest && onAskAgent)) && (
               <button
                 disabled={busy}
                 onClick={() => run(() => api.deleteComment(projectId, c.id))}

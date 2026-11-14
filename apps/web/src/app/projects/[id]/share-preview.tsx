@@ -9,8 +9,8 @@ import { api } from "@/lib/api";
 
 /*
  * "Share preview link…": links that let anyone (no Forge account) view this project's preview until
- * they expire. Forge stores only a hash, so a link is shown once, when it's made; revoking one cuts
- * access right away.
+ * they expire. Each active link can be copied again (Forge keeps it encrypted; links made before
+ * that can't be shown). Revoking one cuts access right away.
  */
 
 const DURATIONS: { id: PreviewShareDuration; label: string }[] = [
@@ -33,10 +33,21 @@ export function SharePreviewModal({ projectId, open, onClose }: { projectId: str
   const [shares, setShares] = useState<PreviewShare[] | null>(null);
   const [duration, setDuration] = useState<PreviewShareDuration>("24h");
   const [label, setLabel] = useState("");
+  const [allowFeedback, setAllowFeedback] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [created, setCreated] = useState<PreviewShare | null>(null);
-  const [copied, setCopied] = useState(false);
+  /** The link that was just copied ("new" for the one just created), for the "Copied" state. */
+  const [copied, setCopied] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const copy = (key: string, url: string) =>
+    navigator.clipboard.writeText(url).then(
+      () => {
+        setCopied(key);
+        setTimeout(() => setCopied((c) => (c === key ? null : c)), 2000);
+      },
+      () => setError("Couldn't copy. Select the link and copy it yourself."),
+    );
 
   const load = useCallback(() => api.previewShares(projectId).then(setShares, (e) => setError(e instanceof Error ? e.message : String(e))), [projectId]);
   useEffect(() => {
@@ -47,11 +58,11 @@ export function SharePreviewModal({ projectId, open, onClose }: { projectId: str
     setBusy("create");
     setError(null);
     try {
-      const s = await api.createPreviewShare(projectId, { duration, ...(label.trim() ? { label: label.trim() } : {}) });
+      const s = await api.createPreviewShare(projectId, { duration, allowFeedback, ...(label.trim() ? { label: label.trim() } : {}) });
       setCreated(s);
-      setCopied(false);
+      setCopied(null);
       setLabel("");
-      if (s.url) await navigator.clipboard.writeText(s.url).then(() => setCopied(true), () => undefined);
+      if (s.url) await copy("new", s.url);
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -68,26 +79,26 @@ export function SharePreviewModal({ projectId, open, onClose }: { projectId: str
         onClose();
       }}
       title="Share the preview"
-      description="Anyone with the link can view this app until it expires. They can't see the chat, code or settings."
+      description="Anyone with the link can view this app until it expires, and leave feedback if you allow it. They can't see the chat, code or settings."
       icon={<Link2 size={20} aria-hidden />}
       busy={busy === "create"}
     >
       <div className="flex flex-col gap-4">
         {created?.url && (
           <div className="rounded-[10px] border border-primary/40 bg-primary-weak/50 p-3">
-            <p className="text-[13px] font-semibold">{copied ? "Link copied" : "Your link"}</p>
+            <p className="text-[13px] font-semibold">{copied === "new" ? "Link copied" : "Your new link"}</p>
             <div className="mt-1.5 flex gap-2">
               <input className="in h-9 min-w-0 flex-1 font-mono text-[12px]" readOnly value={created.url} onFocus={(e) => e.currentTarget.select()} aria-label="Share link" />
               <button
                 type="button"
                 className="btn btn-sm h-9"
-                onClick={() => navigator.clipboard.writeText(created.url!).then(() => setCopied(true), () => undefined)}
+                onClick={() => void copy("new", created.url!)}
               >
-                {copied ? <Check size={14} aria-hidden /> : <Copy size={14} aria-hidden />}
-                {copied ? "Copied" : "Copy"}
+                {copied === "new" ? <Check size={14} aria-hidden /> : <Copy size={14} aria-hidden />}
+                {copied === "new" ? "Copied" : "Copy"}
               </button>
             </div>
-            <p className="lab mt-1.5">Forge shows this link only now. Expires {new Date(created.expiresAt).toLocaleString()}.</p>
+            <p className="lab mt-1.5">Expires {new Date(created.expiresAt).toLocaleString()}. You can copy it again later under Active links.</p>
           </div>
         )}
 
@@ -115,6 +126,13 @@ export function SharePreviewModal({ projectId, open, onClose }: { projectId: str
             placeholder="Label (optional), e.g. For the client review"
             aria-label="Label"
           />
+          <label className="flex items-start gap-2 text-[13px]">
+            <input type="checkbox" className="mt-0.5" checked={allowFeedback} onChange={(e) => setAllowFeedback(e.target.checked)} />
+            <span>
+              Let visitors leave feedback
+              <span className="block text-[12px] text-ink-3">They pin notes to parts of the app under a name they type. The notes appear in Comments.</span>
+            </span>
+          </label>
           {error && (
             <p className="text-[13px] text-danger" role="alert">
               {error}
@@ -136,8 +154,25 @@ export function SharePreviewModal({ projectId, open, onClose }: { projectId: str
                     <p className="truncate text-[13.5px] font-medium">{s.label || "Preview link"}</p>
                     <p className="text-[12px] text-ink-3">
                       {until(s.expiresAt)} · opened {s.uses} time{s.uses === 1 ? "" : "s"} · by {s.createdBy}
+                      {s.allowFeedback ? " · feedback on" : ""}
                     </p>
                   </div>
+                  {s.url ? (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => void copy(s.id, s.url!)}
+                      aria-label={`Copy the link${s.label ? ` “${s.label}”` : ""}`}
+                      data-tip={s.url}
+                    >
+                      {copied === s.id ? <Check size={13} aria-hidden /> : <Copy size={13} aria-hidden />}
+                      {copied === s.id ? "Copied" : "Copy"}
+                    </button>
+                  ) : (
+                    <span className="text-[11.5px] text-ink-3" title="Made before Forge kept links. It still works; make a new one to get a link you can copy.">
+                      Can&apos;t be shown
+                    </span>
+                  )}
                   <button
                     type="button"
                     className="btn btn-g btn-sm btn-danger"

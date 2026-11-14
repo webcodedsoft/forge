@@ -1,7 +1,22 @@
 import type { CheckName, CheckOutcome, QaIssue, RunMode } from "@forge/protocol";
-import { cleanRunError, TestInput } from "@forge/protocol";
-import { replayTests, runSavedTests } from "./tests.ts";
+import { cleanRunError, SaveTestInput, SpecUpdate } from "@forge/protocol";
+import { replayTests, runSavedTests, saveTest } from "./tests.ts";
+import {
+  applyStagedSpec,
+  coverPrompt,
+  dropStagedSpec,
+  getSpec,
+  hasStagedSpec,
+  linkTest,
+  SPEC_FILE,
+  SPEC_REMINDER,
+  specMarkdown,
+  specPrompt,
+  specQaPrompt,
+  stageSpecUpdate,
+} from "./spec.ts";
 import { scanProject } from "./security.ts";
+import { reviewAfterCommit } from "./review.ts";
 import { dataSourcesPrompt } from "./datasources.ts";
 import { settleFixRun } from "./problems.ts";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
@@ -16,7 +31,7 @@ import { checkComponent, type ComponentInput, libraryPrompt, libraryReminder, sa
 import { db, schema } from "./db/index.ts";
 import { env } from "./env.ts";
 import { appendEvent, publish } from "./events.ts";
-import { ensureDevServer, ensureSandbox, exec, execLines, waitPrepared } from "./sandbox.ts";
+import { ensureDevServer, ensureSandbox, exec, execLines, putFiles, waitPrepared } from "./sandbox.ts";
 
 /*
  * One agent run at a time per project. A run is a loop:
@@ -120,6 +135,7 @@ type RunnerLine =
   | { kind: "qa_test"; test: unknown }
   | { kind: "qa_frame"; data: string }
   | { kind: "library_save"; component: ComponentInput }
+  | { kind: "spec_update"; update: unknown }
   | { kind: "done"; status: "completed" | "failed" | "cancelled"; result?: string; error?: string };
 
 type TurnStatus = "completed" | "failed" | "cancelled";
@@ -180,10 +196,30 @@ function summarize(tool: string, input: unknown): string {
       return `${str(i.path) || "/"}${Array.isArray(i.viewports) ? ` · ${(i.viewports as string[]).join(" and ")}` : " · desktop and phone"}`;
     case "mcp__browser__propose_test":
       return `Test: ${str(i.title)}`;
+    case "mcp__forge__update_spec": {
+      const n = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+      const parts = [n(i.add) ? `${n(i.add)} added` : "", n(i.change) ? `${n(i.change)} changed` : "", n(i.remove) ? `${n(i.remove)} removed` : "", i.summary ? "summary" : ""];
+      return `Spec: ${parts.filter(Boolean).join(", ") || "no change"}`;
+    }
     default:
       return "";
   }
 }
+
+/**
+ * Runs Forge starts itself around work that is already in the workspace (changes merged in from
+ * GitHub). `prompt` stays the short line shown in the chat and used as the version's message.
+ */
+export type RunOptions = {
+  /** What the agent is told first instead of `prompt`; null: no agent turn, go straight to the checks. */
+  agentPrompt?: string | null;
+  /** Put before the fix request when the checks fail (the agent may not know what changed). */
+  fixPreface?: string;
+  /** Skip the code-structure review (the changes aren't the agent's). */
+  skipStructure?: boolean;
+  /** Called after the run, with whether a version was saved. */
+  onDone?: (committed: boolean) => void | Promise<void>;
+};
 
 /** The model picked for each running run ("provider:model"), read by every turn of it. */
 const runModel = new Map<string, string | null>();
@@ -195,6 +231,7 @@ export async function startRun(
   mode: RunMode = "build",
   /** "provider:model" from the prompt box; undefined: the project's last choice. */
   model?: string | null,
+  opts: RunOptions = {},
 ) {
   if (active.has(projectId)) throw new RunConflictError("A run is already in progress for this project.");
   const runId = nanoid(10);
@@ -240,10 +277,11 @@ export async function startRun(
     throw err;
   }
 
-  void execute(projectId, runId, prompt, entry, mode)
+  void execute(projectId, runId, prompt, entry, mode, opts)
     .catch(() => false)
     .then(async (committed) => {
       active.delete(projectId);
+      if (opts.onDone) await Promise.resolve(opts.onDone(committed)).catch((e) => console.error("run follow-up failed", e));
       runModel.delete(runId);
       forgetRunCost(runId);
       void settleFixRun(projectId, runId, committed).catch((e) => console.error("could not settle fixed problems", e));
@@ -264,7 +302,7 @@ export async function startRun(
 }
 
 /** Runs the build loop. Resolves true when a new version was saved. */
-async function execute(projectId: string, runId: string, prompt: string, entry: Active, mode: RunMode = "build"): Promise<boolean> {
+async function execute(projectId: string, runId: string, prompt: string, entry: Active, mode: RunMode = "build", opts: RunOptions = {}): Promise<boolean> {
   let committed = false;
   let status: TurnStatus = "failed";
   let error: string | undefined;
@@ -283,7 +321,8 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
         : mode === "design"
           ? DESIGN_MODE_PROMPT + "\n\n"
           : "";
-    let turnPrompt = (note ? `${note}\n\n` : "") + modePrefix + prompt;
+    let turnPrompt = (note ? `${note}\n\n` : "") + modePrefix + (opts.agentPrompt ?? prompt);
+    let skipAgent = opts.agentPrompt === null;
 
     // Chat mode: one read-only turn; nothing to check or save.
     if (mode === "chat") {
@@ -293,20 +332,26 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
     }
 
     let continues = 0;
-    let structureReviewed = false;
+    let structureReviewed = Boolean(opts.skipStructure);
     for (let round = 0; mode !== "chat"; round++) {
-      const turn = await agentTurn(projectId, runId, turnPrompt, undefined, { autonomous: entry.autonomous });
-      status = turn.status;
-      error = turn.error;
-      if (status !== "completed" || entry.cancelled) break;
-      // After an approved plan the agent should build all of it. If it stops to ask permission for
-      // the next phase, answer for the user and keep going (this isn't a fix round).
-      if ((entry.planApproved || entry.autonomous) && continues < MAX_PLAN_CONTINUES && asksToContinue(turn.result)) {
-        continues++;
-        await appendEvent({ type: "notice", projectId, runId, text: entry.autonomous ? "Autonomous: continuing without asking…" : "Continuing with the approved plan…" });
-        turnPrompt = CONTINUE_PLAN_PROMPT;
-        round--;
-        continue;
+      if (skipAgent) {
+        // The changes are already in the workspace: check them first; the agent only fixes.
+        skipAgent = false;
+        status = "completed";
+      } else {
+        const turn = await agentTurn(projectId, runId, turnPrompt, undefined, { autonomous: entry.autonomous });
+        status = turn.status;
+        error = turn.error;
+        if (status !== "completed" || entry.cancelled) break;
+        // After an approved plan the agent should build all of it. If it stops to ask permission for
+        // the next phase, answer for the user and keep going (this isn't a fix round).
+        if ((entry.planApproved || entry.autonomous) && continues < MAX_PLAN_CONTINUES && asksToContinue(turn.result)) {
+          continues++;
+          await appendEvent({ type: "notice", projectId, runId, text: entry.autonomous ? "Autonomous: continuing without asking…" : "Continuing with the approved plan…" });
+          turnPrompt = CONTINUE_PLAN_PROMPT;
+          round--;
+          continue;
+        }
       }
       if (!(await hasChanges(projectId))) break; // nothing to check or save
 
@@ -337,7 +382,7 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
         error = `Forge's checks still fail after ${MAX_FIX_ROUNDS} fix attempts, so this version was not saved.`;
         break;
       }
-      turnPrompt = fixPrompt(result.checks);
+      turnPrompt = (opts.fixPreface ? `${opts.fixPreface}\n\n` : "") + fixPrompt(result.checks);
     }
   } catch (err) {
     status = "failed";
@@ -346,6 +391,11 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
 
   if (status === "cancelled" && entry.cancelled) error = undefined;
   unsaved = await hasChanges(projectId).catch(() => false);
+  // Spec changes from a turn that changed no files (e.g. "write the spec from the app") apply now;
+  // with unsaved changes they wait for the version that includes them.
+  if (status === "completed" && !unsaved && hasStagedSpec(projectId)) {
+    await applyStagedSpec(projectId, await runStarter(projectId, runId)).catch((e) => console.error("could not update the spec", e));
+  }
 
   if (error) console.error(`run ${runId} failed:`, error);
   await appendEvent({ type: "run.finished", projectId, runId, status, error: error ? cleanRunError(error) : undefined, unsaved }).catch((e) =>
@@ -415,11 +465,12 @@ async function agentTurn(
   if (!qa) await syncLibrary(projectId).catch((e) => console.error("library sync failed", e));
   const libraryText = qa ? "" : await libraryPrompt();
   const libraryNote = qa ? "" : await libraryReminder();
+  const specText = qa ? "" : await specPrompt(projectId).catch(() => "");
   const redact = await redactor(projectId);
   const input = qa
     ? { prompt, mode: "qa", model: ai.model, appendSystemPrompt: [qa.systemPrompt, brainText].filter(Boolean).join("\n\n") }
     : {
-        prompt: opts.readOnly ? prompt : prompt + libraryNote,
+        prompt: opts.readOnly ? prompt : prompt + libraryNote + SPEC_REMINDER,
         readOnly: opts.readOnly || undefined,
         autonomous: opts.autonomous || undefined,
         sessionId: proj?.sessionId ?? undefined,
@@ -432,6 +483,7 @@ async function agentTurn(
           secretsText,
           dataText,
           libraryText,
+          specText,
           brainText,
         ]
           .filter(Boolean)
@@ -498,6 +550,13 @@ async function agentTurn(
               text: `Saved "${component.title}" to the team component library (${component.files.length} file${component.files.length === 1 ? "" : "s"}). Every project can now reuse it.`,
             });
           });
+          break;
+        }
+        case "spec_update": {
+          // Staged until this version is saved (or the run ends without file changes).
+          if (qa || opts.readOnly) break;
+          const update = SpecUpdate.safeParse(line.update);
+          if (update.success) stageSpecUpdate(projectId, update.data);
           break;
         }
         case "qa_frame":
@@ -592,7 +651,14 @@ You test the running app like a careful teammate would, using the browser tools 
  * Start a QA run. `focus`: the request a new version was saved for (auto-test).
  * `testRequest`: the user described a test to create; the run walks through just that and proposes it.
  */
-export async function startQa(projectId: string, user: { id: string; name: string }, focus?: string, testRequest?: string) {
+export async function startQa(
+  projectId: string,
+  user: { id: string; name: string },
+  focus?: string,
+  testRequest?: string,
+  /** Write tests for these spec criteria (ids); passing ones are saved and linked automatically. */
+  cover?: string[],
+) {
   if (active.has(projectId)) throw new RunConflictError("A run is already in progress for this project.");
   const runId = nanoid(10);
   const entry: Active = { runId, cancelled: false, cancel: async () => {} };
@@ -606,7 +672,9 @@ export async function startQa(projectId: string, user: { id: string; name: strin
       type: "run.started",
       projectId,
       runId,
-      prompt: testRequest
+      prompt: cover
+        ? `Write tests for ${cover.length === 1 ? "a spec criterion" : `${cover.length} spec criteria`}`
+        : testRequest
         ? `Create a test: ${testRequest.slice(0, 300)}`
         : focus
           ? `Automatic test after: ${focus.split("\n")[0]!.slice(0, 200)}`
@@ -623,7 +691,7 @@ export async function startQa(projectId: string, user: { id: string; name: strin
     active.delete(projectId);
     throw err;
   }
-  void executeQa(projectId, runId, entry, focus, testRequest).finally(() => {
+  void executeQa(projectId, runId, entry, focus, testRequest, cover, user.name).finally(() => {
     active.delete(projectId);
     forgetRunCost(runId);
     if (!entry.cancelled) void runNext(projectId).catch((e) => console.error("queued message did not start", e));
@@ -631,7 +699,7 @@ export async function startQa(projectId: string, user: { id: string; name: strin
   return runId;
 }
 
-async function executeQa(projectId: string, runId: string, entry: Active, focus?: string, testRequest?: string) {
+async function executeQa(projectId: string, runId: string, entry: Active, focus?: string, testRequest?: string, cover?: string[], userName = "Forge") {
   const issues: QaIssue[] = [];
   const proposals: unknown[] = [];
   let status: TurnStatus = "failed";
@@ -654,7 +722,14 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
       .slice(0, 8)
       .reverse()
       .map((p, i) => `${i + 1}. ${p.prompt.slice(0, 1500)}`);
-    const prompt = testRequest
+    const spec = await getSpec(projectId).catch(() => null);
+    const toCover = cover ? (spec?.criteria ?? []).filter((c) => cover.includes(c.id)) : [];
+    const specText = cover || testRequest ? "" : await specQaPrompt(projectId).catch(() => "");
+    const prompt = cover
+      ? toCover.length
+        ? coverPrompt(toCover)
+        : "The criteria to test no longer exist. Say so and stop."
+      : testRequest
       ? [
           `Create a repeatable test for this, as the team described it:\n${testRequest.slice(0, 2000)}`,
           "Walk through it in the browser first. If it works, call propose_test once with the steps and expect checks. If it doesn't work, report it with report_issue instead. Don't test anything else.",
@@ -665,24 +740,38 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
         ? [`A new version was just saved for this request. Test it first and thoroughly, then briefly re-check the main features:\n${focus.slice(0, 2000)}`]
         : []),
       requests.length ? `It was built from these requests (oldest first); check that each works:\n${requests.join("\n")}` : "Explore its main features.",
+      ...(specText ? [specText] : []),
       "Report each problem with report_issue, then summarize.",
     ].join("\n\n");
 
     const turn = await agentTurn(projectId, runId, prompt, {
       systemPrompt: QA_SYSTEM_PROMPT,
       onIssue: (i) => issues.push(i),
-      onTest: (t) => proposals.length < 8 && proposals.push(t),
+      onTest: (t) => proposals.length < (cover ? 20 : 8) && proposals.push(t),
     });
     status = entry.cancelled ? "cancelled" : turn.status;
     error = turn.error;
     if (status === "completed") {
       // Replay each proposed test once, so the team only gets offered ones that pass.
+      const known = new Set((spec?.criteria ?? []).map((c) => c.id));
       const valid = proposals.flatMap((p) => {
-        const r = TestInput.safeParse(p);
-        return r.success ? [r.data] : [];
+        const r = SaveTestInput.safeParse(p);
+        if (!r.success) return [];
+        // Only ids of criteria that exist; the agent may misremember one.
+        const { criterionId, ...test } = r.data;
+        return [{ ...test, ...(criterionId && known.has(criterionId) ? { criterionId } : {}) }];
       });
       const results = valid.length ? await replayTests(projectId, valid) : [];
-      const tests = valid.map((t, i) => ({ ...t, result: results[i]! }));
+      const tests: (SaveTestInput & { result: (typeof results)[number]; saved?: boolean })[] = valid.map((t, i) => ({ ...t, result: results[i]! }));
+      // Tests written for spec criteria on request: keep the passing ones and link them.
+      if (cover) {
+        for (const t of tests) {
+          if (!t.result.ok || !t.criterionId || !cover.includes(t.criterionId)) continue;
+          const saved = await saveTest(projectId, { title: t.title, steps: t.steps }, { name: userName }, t.result);
+          await linkTest(projectId, t.criterionId, saved.id);
+          t.saved = true;
+        }
+      }
       await appendEvent({ type: "qa.report", projectId, runId, summary: turn.result ?? "", issues, ...(tests.length ? { tests } : {}) });
     }
   } catch (err) {
@@ -783,6 +872,7 @@ export async function listChanges(projectId: string): Promise<string[]> {
 /** Commit what the agent changed (only called when the checks pass). */
 async function commitChanges(projectId: string, runId: string, prompt: string) {
   const message = prompt.split("\n")[0]!.slice(0, 72) || "Agent changes";
+  await saveSpecWithVersion(projectId, runId).catch((e) => console.error("could not update the spec", e));
   const r = await exec(projectId, [
     "sh",
     "-c",
@@ -792,10 +882,36 @@ async function commitChanges(projectId: string, runId: string, prompt: string) {
   ]);
   const out = r.stdout.trim();
   if (r.exitCode === 0 && out && out !== "NOCHANGE") {
-    await appendEvent({ type: "commit", projectId, runId, sha: out.split("\n").pop()!, message });
+    const sha = out.split("\n").pop()!;
+    await appendEvent({ type: "commit", projectId, runId, sha, message });
+    // Keep the screenshots and accessibility scan the checks just made of this version.
+    await reviewAfterCommit(projectId, sha, runId);
     return true;
   }
   return false;
+}
+
+/** Who started a run (for "updated by" on things the run changes). */
+async function runStarter(projectId: string, runId: string): Promise<string> {
+  const [starter] = await db
+    .select({ userName: sql<string>`${schema.projectEvent.payload}->>'userName'` })
+    .from(schema.projectEvent)
+    .where(and(eq(schema.projectEvent.projectId, projectId), eq(schema.projectEvent.runId, runId), eq(schema.projectEvent.type, "run.started")));
+  return starter?.userName ?? "Forge";
+}
+
+/**
+ * Just before a version is saved: apply the spec changes the agent recorded, and (projects made
+ * in Forge) write the spec to docs/SPEC.md so it is part of the version and reaches GitHub.
+ * Imported repositories keep their own docs; their spec lives in Forge only.
+ */
+async function saveSpecWithVersion(projectId: string, runId: string) {
+  await applyStagedSpec(projectId, await runStarter(projectId, runId));
+  const [p] = await db.select({ name: schema.project.name, source: schema.project.source }).from(schema.project).where(eq(schema.project.id, projectId));
+  if (!p || p.source !== "template") return;
+  const spec = await getSpec(projectId);
+  if (!spec.summary && !spec.criteria.length) return;
+  await putFiles(projectId, [{ path: SPEC_FILE, content: specMarkdown(spec, p.name) }]);
 }
 
 /** Throw away uncommitted changes (e.g. after checks kept failing). Ignored files such as node_modules stay. */
@@ -810,6 +926,7 @@ export async function discardChanges(projectId: string, user: { name: string }) 
     "git reset -q --hard HEAD && git clean -fdq && pnpm install --frozen-lockfile --prefer-offline >/tmp/discard-install.log 2>&1",
   ]);
   if (r.exitCode !== 0) throw new Error(`Discard failed: ${r.stderr || r.stdout}`);
+  dropStagedSpec(projectId); // the spec changes belonged to the discarded work
   await appendEvent({ type: "changes.discarded", projectId, runId: `discard-${nanoid(8)}`, files, userName: user.name });
   return { discarded: files.length };
 }
@@ -845,14 +962,17 @@ async function staleFilesNote(projectId: string, currentRunId: string): Promise<
     .where(
       and(
         eq(schema.projectEvent.projectId, projectId),
-        inArray(schema.projectEvent.type, ["run.finished", "commit", "changes.discarded", "branch"]),
+        inArray(schema.projectEvent.type, ["run.finished", "commit", "changes.discarded", "branch", "github.sync"]),
       ),
     )
     .orderBy(desc(schema.projectEvent.seq))
     .limit(50);
   for (const { payload } of rows) {
-    const e = payload as { type: string; runId: string; restoredFrom?: string; action?: string; branch?: string };
+    const e = payload as { type: string; runId: string; restoredFrom?: string; action?: string; branch?: string; commits?: number };
     if (e.runId === currentRunId) continue;
+    if (e.type === "github.sync") {
+      return `(Note from Forge: since your last turn, ${e.commits ?? "some"} change(s) that engineers made on GitHub were merged into this project. Files may differ from what you remember; re-read them before editing.)`;
+    }
     if (e.type === "run.finished") return null; // nothing changed since the last run
     if (e.type === "commit" && e.restoredFrom) {
       return `(Note from Forge: since your last turn the user restored the app to an earlier version, ${e.restoredFrom.slice(0, 7)}. Files may differ from what you remember; re-read them before editing.)`;

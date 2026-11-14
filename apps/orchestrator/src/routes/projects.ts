@@ -247,7 +247,7 @@ export const projects = new Hono<AppEnv>()
   .post("/:id/preview-shares", async (c) => {
     const parsed = CreatePreviewShareInput.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: "Choose how long the link should work." }, 400);
-    return c.json(await createShare(c.req.param("id"), parsed.data.duration, parsed.data.label, c.get("user").name), 201);
+    return c.json(await createShare(c.req.param("id"), parsed.data.duration, parsed.data.label, c.get("user").name, parsed.data.allowFeedback ?? true), 201);
   })
   .delete("/:id/preview-shares/:sid", async (c) => {
     const ok = await revokeShare(c.req.param("id"), c.req.param("sid"));

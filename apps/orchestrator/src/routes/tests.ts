@@ -1,4 +1,5 @@
-import { TestInput } from "@forge/protocol";
+import { SaveTestInput } from "@forge/protocol";
+import { linkTest } from "../spec.ts";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../index.ts";
@@ -9,9 +10,13 @@ import { deleteTest, listTests, runSavedTests, saveTest } from "../tests.ts";
 export const testRoutes = new Hono<AppEnv>()
   .get("/:id/tests", async (c) => c.json(await listTests(c.req.param("id"))))
   .post("/:id/tests", async (c) => {
-    const body = TestInput.safeParse(await c.req.json().catch(() => null));
+    const body = SaveTestInput.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: "That test isn't valid." }, 400);
-    return c.json(await saveTest(c.req.param("id"), body.data, c.get("user")), 201);
+    const { criterionId, ...test } = body.data;
+    const saved = await saveTest(c.req.param("id"), test, c.get("user"));
+    // A test the QA agent proposed for a spec criterion becomes that criterion's proof.
+    if (criterionId) await linkTest(c.req.param("id"), criterionId, saved.id);
+    return c.json(saved, 201);
   })
   .delete("/:id/tests/:tid", async (c) => {
     await deleteTest(c.req.param("id"), c.req.param("tid"));

@@ -5,6 +5,7 @@ import { ExternalLink, GitBranch, ShieldAlert } from "lucide-react";
 import { Spinner } from "@/components/loading";
 import { useEffect, useRef, useState } from "react";
 import { ApiError, api } from "@/lib/api";
+import { GitHubRoundTrip } from "./github-roundtrip";
 
 /*
  * Push to GitHub (Forge doesn't deploy; the company's GitHub is where code goes).
@@ -12,6 +13,8 @@ import { ApiError, api } from "@/lib/api";
  *   made in Forge, has a repo   → push new versions to its main
  *   imported                    → send changes as a pull request
  * Saved tests and the security check run first; failures block the push (project admins may override).
+ * Once the project has a repository, the menu also shows the way back (github-roundtrip.tsx):
+ * changes made on GitHub to bring in, and review feedback to hand to the agent.
  */
 
 const slug = (s: string) =>
@@ -28,7 +31,10 @@ export function GitHubButton({
   disabledReason,
   refreshKey,
   onOpenHealth,
+  onStarted,
 }: {
+  /** A run started from here (changes brought in, feedback sent): show the chat. */
+  onStarted: () => void;
   projectId: string;
   projectName: string;
   disabled: boolean;
@@ -110,7 +116,7 @@ export function GitHubButton({
         {imported ? "Pull request" : "Push to GitHub"}
       </button>
       {open && (
-        <div className="pop absolute right-0 top-10 z-40 flex w-80 flex-col gap-3 p-3.5 text-[13px]" role="dialog" aria-label="Push to GitHub">
+        <div className="pop absolute right-0 top-10 z-40 flex max-h-[calc(100dvh-7rem)] w-96 max-w-[calc(100vw-1.5rem)] flex-col gap-3 overflow-y-auto p-3.5 text-[13px]" role="dialog" aria-label="GitHub">
           {status.repo ? (
             <a href={status.url!} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 font-mono text-xs text-primary underline">
               {status.repo}
@@ -198,6 +204,17 @@ export function GitHubButton({
                 "Check and push"
               )}
             </button>
+          )}
+          {status.repo && (
+            <GitHubRoundTrip
+              projectId={projectId}
+              disabled={disabled}
+              disabledReason={disabledReason}
+              onStarted={() => {
+                setOpen(false);
+                onStarted();
+              }}
+            />
           )}
         </div>
       )}

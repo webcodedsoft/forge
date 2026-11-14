@@ -4,6 +4,7 @@ import { nanoid } from "nanoid";
 import { db, schema } from "./db/index.ts";
 import { appendEvent } from "./events.ts";
 import { ensureDevServer, ensureSandbox, exec } from "./sandbox.ts";
+import { specResultsChanged, unlinkTest } from "./spec.ts";
 
 /*
  * Saved tests: steps replayed in a real browser (the sandbox's Chromium, via the checks'
@@ -139,16 +140,26 @@ export async function listTests(projectId: string): Promise<SavedTest[]> {
   return rows.map(toApi);
 }
 
-export async function saveTest(projectId: string, input: TestInput, user: { name: string }): Promise<SavedTest> {
+/** `result`: the outcome of a replay Forge just did (a proposed test), stored as its first result. */
+export async function saveTest(projectId: string, input: TestInput, user: { name: string }, result?: TestRunResult): Promise<SavedTest> {
+  const sha = result ? (await exec(projectId, ["git", "rev-parse", "HEAD"]).catch(() => null))?.stdout.trim() || null : null;
   const [row] = await db
     .insert(schema.savedTest)
-    .values({ id: nanoid(12), projectId, title: input.title, steps: input.steps, createdBy: user.name })
+    .values({
+      id: nanoid(12),
+      projectId,
+      title: input.title,
+      steps: input.steps,
+      createdBy: user.name,
+      ...(result ? { lastResult: { ...result, sha, at: new Date().toISOString() } } : {}),
+    })
     .returning();
   return toApi(row!);
 }
 
 export async function deleteTest(projectId: string, id: string) {
   await db.delete(schema.savedTest).where(and(eq(schema.savedTest.projectId, projectId), eq(schema.savedTest.id, id)));
+  await unlinkTest(projectId, id); // a spec criterion it proved is untested again
 }
 
 /**
@@ -170,5 +181,6 @@ export async function runSavedTests(projectId: string, trigger: "version" | "man
   }
   const summary = rows.map((r, i) => ({ testId: r.id, title: r.title, ...results[i]! }));
   await appendEvent({ type: "tests.result", projectId, runId: `tests-${nanoid(8)}`, trigger, sha, results: summary });
+  specResultsChanged(projectId); // criteria show their test's new result
   return summary;
 }

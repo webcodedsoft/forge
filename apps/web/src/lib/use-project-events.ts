@@ -31,6 +31,10 @@ export type LiveState = {
   projectVersion: number;
   /** Bumped when a new security report is ready. */
   securityVersion: number;
+  /** Bumped when a version's review (screenshots, accessibility) is ready. */
+  reviewVersion: number;
+  /** Bumped when the living spec changes. */
+  specVersion: number;
   /** Throw away what's shown and replay the project's events from the start (when the page and
    *  the server disagree, e.g. it shows a run the server has already finished). */
   resync: () => void;
@@ -51,6 +55,8 @@ export function useProjectEvents(projectId: string): LiveState {
   /** Bumped when the project's details change (e.g. Forge named it); the builder refetches it. */
   const [projectVersion, setProjectVersion] = useState(0);
   const [securityVersion, setSecurityVersion] = useState(0);
+  const [reviewVersion, setReviewVersion] = useState(0);
+  const [specVersion, setSpecVersion] = useState(0);
   const lastSeq = useRef(0);
   const [resyncKey, setResyncKey] = useState(0);
   const resync = useCallback(() => {
@@ -116,6 +122,10 @@ export function useProjectEvents(projectId: string): LiveState {
           setPresence(frame.users);
         } else if (frame.type === "security_changed") {
           setSecurityVersion((v) => v + 1);
+        } else if (frame.type === "review_changed") {
+          setReviewVersion((v) => v + 1);
+        } else if (frame.type === "spec_changed") {
+          setSpecVersion((v) => v + 1);
         } else if (frame.type === "project_changed") {
           setProjectVersion((v) => v + 1);
         } else if (frame.type === "queue_changed") {
@@ -160,5 +170,5 @@ export function useProjectEvents(projectId: string): LiveState {
   }, [projectId, resyncKey]);
 
   const events = log.projectId === projectId ? log.events : [];
-  return { events, streaming, connected, caughtUp: caughtUpFor === projectId, qaFrame, presence, commentsVersion, problemsVersion, securityVersion, queueVersion, projectVersion, resync };
+  return { events, streaming, connected, caughtUp: caughtUpFor === projectId, qaFrame, presence, commentsVersion, problemsVersion, securityVersion, reviewVersion, specVersion, queueVersion, projectVersion, resync };
 }

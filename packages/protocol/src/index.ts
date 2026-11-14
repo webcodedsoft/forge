@@ -125,8 +125,18 @@ export const TestRunResult = z.object({
 });
 export type TestRunResult = z.infer<typeof TestRunResult>;
 
+/** Saving a test, optionally as the proof of a spec criterion. */
+export const SaveTestInput = TestInput.extend({ criterionId: z.string().max(20).optional() });
+export type SaveTestInput = z.infer<typeof SaveTestInput>;
+
 /** A test the QA agent proposed, with the result of Forge replaying it. */
-export const ProposedTest = TestInput.extend({ result: TestRunResult });
+export const ProposedTest = TestInput.extend({
+  result: TestRunResult,
+  /** The spec criterion it proves, when the agent named one. */
+  criterionId: z.string().max(20).optional(),
+  /** Forge saved it already (tests written for spec criteria on request). */
+  saved: z.boolean().optional(),
+});
 export type ProposedTest = z.infer<typeof ProposedTest>;
 
 export type SavedTest = TestInput & {
@@ -233,6 +243,17 @@ export const RunEvent = z.discriminatedUnion("type", [
     created: z.boolean(),
     /** A project admin pushed although checks failed. */
     overridden: z.boolean().optional(),
+    userName: z.string(),
+  }),
+  /** Changes made on GitHub were merged into the project and saved as a version. */
+  z.object({
+    ...base,
+    type: z.literal("github.sync"),
+    repo: z.string(),
+    branch: z.string(),
+    commits: z.number().int(),
+    /** Files git could not merge by itself (the agent resolved them). */
+    conflicts: z.number().int(),
     userName: z.string(),
   }),
   /** Saved tests were replayed (after a new version, or on request). */
@@ -625,6 +646,38 @@ export type GitHubStatus = {
   /** The company organization new repos are created in (null: not configured). */
   org: string | null;
 };
+/** Changes on GitHub's branch that the project doesn't have yet. */
+export type GitHubIncoming = {
+  branch: string;
+  /** How many commits the project is missing (of the newest 50 looked at). */
+  behind: number;
+  /** True when all 50 looked at are missing: there may be more. */
+  more: boolean;
+  commits: { sha: string; message: string; author: string; at: string }[];
+};
+
+export type PrComment = { author: string; body: string; at: string; url: string };
+/** What reviewers and CI said about the project's pull request (or, without one, CI on the pushed branch). */
+export type PrFeedback = {
+  pr: { number: number; url: string; state: "OPEN" | "MERGED" | "CLOSED"; title: string; reviewDecision: string | null } | null;
+  /** Unresolved review conversations on lines of code. */
+  threads: { id: string; path: string; line: number | null; outdated: boolean; comments: PrComment[]; sent: boolean }[];
+  /** Review summaries with text ("Changes requested: …"). */
+  reviews: (PrComment & { id: string; state: string; sent: boolean })[];
+  /** The pull request's general conversation. */
+  comments: (PrComment & { id: string; sent: boolean })[];
+  checks: { name: string; state: "failing" | "pending" | "passing"; url: string | null; summary: string | null }[];
+  /** False when GitHub wouldn't show the checks (the Forge app lacks permission). */
+  checksAvailable: boolean;
+};
+
+export const AddressFeedbackInput = z.object({
+  /** Ids of threads, reviews and comments to hand to the agent. */
+  ids: z.array(z.string().max(120)).max(60),
+  /** Also hand over the failing checks (with the end of their logs). */
+  checks: z.boolean().optional(),
+});
+
 /** A repository the connected GitHub app can see (the import picker). */
 export type GitHubRepo = {
   fullName: string;
@@ -737,6 +790,93 @@ export type AppProblem = {
   lastSeen: string;
 };
 
+/* -------------------------------- Living spec -------------------------------- */
+
+/** One acceptance criterion: something a user can do or see, checkable in the browser. */
+export type SpecCriterion = {
+  id: string;
+  /** A short feature name the criteria are grouped by, e.g. "Voting". */
+  area: string;
+  text: string;
+  /** The saved test that proves it, if any. */
+  testId: string | null;
+  testTitle: string | null;
+  /** untested: no test. not_run: its test hasn't been replayed yet. */
+  status: "untested" | "not_run" | "passing" | "failing";
+  /** failing: why the test failed. */
+  error: string | null;
+  createdBy: string;
+  updatedAt: string;
+};
+
+export type ProjectSpec = {
+  /** Markdown: what the app is for and its main features. */
+  summary: string;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  criteria: SpecCriterion[];
+  tested: number;
+  passing: number;
+  failing: number;
+};
+
+const SpecArea = z.string().trim().min(1).max(60);
+const SpecText = z.string().trim().min(3).max(400);
+export const SpecCriterionInput = z.object({ area: SpecArea, text: SpecText });
+/** Changes to the spec: from the build agent's update_spec tool, or the Spec tab. */
+export const SpecUpdate = z.object({
+  summary: z.string().trim().max(6000).optional(),
+  add: z.array(SpecCriterionInput).max(60).optional(),
+  change: z.array(z.object({ id: z.string().max(20), text: SpecText.optional(), area: SpecArea.optional() })).max(60).optional(),
+  remove: z.array(z.string().max(20)).max(60).optional(),
+});
+export type SpecUpdate = z.infer<typeof SpecUpdate>;
+
+/* ------------------------------ Version reviews ------------------------------ */
+
+/** One screenshot of a page in a version, compared with the earlier version's. */
+export type ReviewShot = {
+  route: string;
+  slug: string;
+  viewport: "desktop" | "phone";
+  /** The picture's file name; for a removed page it belongs to the earlier version. */
+  file: string;
+  width: number;
+  height: number;
+  /** new: the page didn't exist before. removed: it no longer exists. */
+  status: "new" | "same" | "changed" | "removed";
+  /** changed: the share of pixels that differ (0 to 1), and the picture that marks them. */
+  ratio?: number;
+  diffFile?: string;
+};
+
+/** An accessibility problem (axe rule) on one page. */
+export type A11yFinding = {
+  id: string;
+  route: string;
+  rule: string;
+  impact: "critical" | "serious" | "moderate" | "minor";
+  help: string;
+  helpUrl: string;
+  /** How many elements have it; `nodes` lists up to three. */
+  count: number;
+  nodes: { target: string; html: string; summary: string }[];
+};
+
+export type VersionReview = {
+  sha: string;
+  /** The earlier version it was compared with (null: the first reviewed version). */
+  baseSha: string | null;
+  at: string;
+  shots: ReviewShot[];
+  a11y: A11yFinding[];
+  /** False when the accessibility scan could not run. */
+  a11yChecked: boolean;
+};
+
+/** Per version: the pages (routes) that look different, are new, or are gone. */
+export type VersionReviewSummary = { sha: string; baseSha: string | null; changed: string[]; added: string[]; removed: string[]; a11y: number };
+
 /* ------------------------- Templates and component library ------------------------- */
 
 export const CreateTemplateInput = z.object({
@@ -816,8 +956,13 @@ export const UpdateCommentInput = z.object({
 export type ProjectComment = {
   id: string;
   parentId: string | null;
+  /** Empty for guest feedback. */
   userId: string;
   userName: string;
+  /** Left through a preview share link by someone without a Forge account. */
+  guest?: boolean;
+  /** Guest feedback: the share link's label, when it has one. */
+  via?: string | null;
   body: string;
   /** Thread roots only. */
   anchor: CommentAnchor | null;
@@ -920,6 +1065,10 @@ export type ServerFrame =
   | { type: "problems_changed"; projectId: string }
   /** A new security report is available. */
   | { type: "security_changed"; projectId: string }
+  /** A version's review (screenshots, accessibility) is ready. */
+  | { type: "review_changed"; projectId: string }
+  /** The living spec changed. */
+  | { type: "spec_changed"; projectId: string }
   /** The message queue changed (queued, removed or started); clients refetch it. */
   | { type: "queue_changed"; projectId: string }
   /** The project's details changed (e.g. Forge named it); clients refetch the project. */
@@ -965,14 +1114,27 @@ export type PreviewShare = {
   revokedAt: string | null;
   lastUsedAt: string | null;
   uses: number;
-  /** Only returned once, when the link is created (Forge keeps a hash, not the link). */
+  /** Visitors may pin feedback to the app. */
+  allowFeedback: boolean;
+  /** The link to send. Missing for links made before Forge kept them (only a hash was stored). */
   url?: string;
 };
 
 export const CreatePreviewShareInput = z.object({
   duration: z.enum(PREVIEW_SHARE_DURATIONS),
   label: z.string().trim().max(80).optional(),
+  allowFeedback: z.boolean().optional(),
 });
+
+/** Feedback from a visitor of a shared preview: a new pinned note, or a reply in one of that link's threads. */
+export const GuestCommentInput = z.union([
+  z.object({ name: z.string().trim().min(1).max(60), body: z.string().trim().min(1).max(4000), anchor: CommentAnchor }),
+  z.object({ name: z.string().trim().min(1).max(60), body: z.string().trim().min(1).max(4000), parentId: z.string().max(40) }),
+]);
+export type GuestCommentInput = z.infer<typeof GuestCommentInput>;
+
+/** What the public share page learns about a link. */
+export type SharedPreviewInfo = { projectName: string; expiresAt: string; frameUrl: string; feedback: boolean };
 
 /* ------------------------------ project names ------------------------------ */
 

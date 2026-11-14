@@ -32,7 +32,7 @@ const MAX_REPO_KB = 300_000;
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const BRANCH = /^[A-Za-z0-9._\/-]{1,200}$/;
 // Use gh as git's credential helper for this command only; no global git config changes.
-const GIT_AUTH = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
+export const GIT_AUTH = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 
 export class GitHubError extends Error {}
 
@@ -41,7 +41,7 @@ export class GitHubError extends Error {}
 const GH_HELPER = GIT_AUTH[3]!;
 const APP_HELPER = 'credential.helper=!f() { echo username=x-access-token; echo "password=$FORGE_GH_TOKEN"; }; f';
 
-async function run(cmd: string, args: string[], opts: { cwd?: string; timeout?: number } = {}) {
+export async function run(cmd: string, args: string[], opts: { cwd?: string; timeout?: number } = {}) {
   let childEnv: NodeJS.ProcessEnv = process.env;
   if (cmd === "gh" || args.includes(GH_HELPER)) {
     const conn = await githubInstallationToken().catch(() => null);
@@ -392,7 +392,7 @@ export async function pushToGitHub(
     const behind = Number(await run("git", ["-C", dir, "rev-list", "--count", "HEAD..origin/main"]));
     if (behind) {
       throw new GitHubError(
-        `GitHub's main has ${behind} change${behind === 1 ? "" : "s"} that weren't made in Forge, so Forge won't overwrite them. Ask an engineer to merge them, or push from a new repo.`,
+        `GitHub's main has ${behind} change${behind === 1 ? "" : "s"} that weren't made in Forge, so Forge won't overwrite them. Bring them into this project first (under "Changes on GitHub" here), then push again.`,
       );
     }
     commits = Number(await run("git", ["-C", dir, "rev-list", "--count", "origin/main..HEAD"]));

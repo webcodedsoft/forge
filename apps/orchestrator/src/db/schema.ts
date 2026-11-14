@@ -89,6 +89,8 @@ export const project = pgTable(
     workBranch: text("work_branch"),
     prUrl: text("pr_url"),
     prNumber: integer("pr_number"),
+    /** Ids of pull-request feedback (review threads, reviews, comments) already handed to the agent. */
+    prFeedbackSent: jsonb("pr_feedback_sent").$type<string[]>().default([]).notNull(),
     /** Team template this project started from, if any. */
     templateId: text("template_id"),
     /** Run the QA agent automatically after each saved version. */
@@ -306,9 +308,11 @@ export const projectComment = pgTable(
       .notNull()
       .references(() => project.id, { onDelete: "cascade" }),
     parentId: text("parent_id"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
+    /** The teammate who wrote it; null for feedback left through a preview share link. */
+    userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+    /** Guest feedback: the name the visitor gave, and the share link they came through. */
+    guestName: text("guest_name"),
+    shareId: text("share_id"),
     body: text("body").notNull(),
     /** CommentAnchor, thread roots only. */
     anchor: jsonb("anchor"),
@@ -397,6 +401,58 @@ export const securityScan = pgTable("security_scan", {
   report: jsonb("report").notNull(),
   at: timestamp("at").defaultNow().notNull(),
 });
+
+/**
+ * How a saved version looks and how accessible it is (review.ts): its screenshots compared with
+ * the earlier version's (ReviewShot[]) and the accessibility findings (A11yFinding[]). The
+ * pictures are files in data/reviews/<project>/<sha>/.
+ */
+export const versionReview = pgTable(
+  "version_review",
+  {
+    projectId: text("project_id")
+      .notNull()
+      .references(() => project.id, { onDelete: "cascade" }),
+    sha: text("sha").notNull(),
+    /** The earlier version the screenshots were compared with. */
+    baseSha: text("base_sha"),
+    shots: jsonb("shots").notNull(),
+    a11y: jsonb("a11y").notNull(),
+    a11yChecked: boolean("a11y_checked").default(false).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex("version_review_pk").on(t.projectId, t.sha), index("version_review_project_idx").on(t.projectId, t.createdAt)],
+);
+
+/* -------------------------------- living spec ------------------------------- */
+
+/** The summary of a project's living spec (spec.ts); its criteria are in spec_criterion. */
+export const projectSpec = pgTable("project_spec", {
+  projectId: text("project_id")
+    .primaryKey()
+    .references(() => project.id, { onDelete: "cascade" }),
+  summary: text("summary").default("").notNull(),
+  updatedBy: text("updated_by"),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+/** One acceptance criterion; `testId` is the saved test that proves it, if any. */
+export const specCriterion = pgTable(
+  "spec_criterion",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => project.id, { onDelete: "cascade" }),
+    area: text("area").notNull(),
+    text: text("text").notNull(),
+    testId: text("test_id"),
+    createdBy: text("created_by").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().$onUpdate(() => new Date()).notNull(),
+  },
+  (t) => [index("spec_criterion_project_idx").on(t.projectId)],
+);
 
 /* ------------------------------- integrations ------------------------------ */
 
@@ -490,7 +546,11 @@ export const previewShare = pgTable(
       .notNull()
       .references(() => project.id, { onDelete: "cascade" }),
     tokenHash: text("token_hash").notNull(),
+    /** The token, encrypted (secrets.ts), so builders can copy the link again. Null for links made before that. */
+    tokenEnc: text("token_enc"),
     label: text("label"),
+    /** Visitors may pin feedback to the app (it lands in the project's Comments). */
+    allowFeedback: boolean("allow_feedback").default(true).notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     expiresAt: timestamp("expires_at").notNull(),

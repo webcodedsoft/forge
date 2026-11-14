@@ -10,6 +10,7 @@
 //   tool_result { toolUseId, ok, output }
 //   usage       { inputTokens, outputTokens, cacheReadTokens, costUsd }
 //   pause       { pauseId, pauseKind: question|plan, payload }   waiting for the user
+//   spec_update { update }                     changes to the living spec (applied when the version is saved)
 //   done        { status: completed|failed|cancelled, result?, error? }
 // Diagnostics go to stderr only.
 //
@@ -173,6 +174,35 @@ const forgeTools = createSdkMcpServer({
       async ({ path, viewports, fullPage }) => lookAtPage(path, viewports, fullPage),
     ),
     tool(
+      "update_spec",
+      "Update the project's living spec (its summary and acceptance criteria) so it matches the app. Call it once, after " +
+        "finishing work that adds, changes or removes behaviour a user can observe. Not for styling, copy tweaks or refactors. " +
+        "The update takes effect when this version is saved.",
+      {
+        summary: z.string().max(6000).optional().describe("Only when the app's purpose or main features changed: Markdown, a short paragraph plus a bullet per main feature."),
+        add: z
+          .array(
+            z.object({
+              area: z.string().max(60).describe('Short feature name the criterion belongs to, e.g. "Voting"'),
+              text: z.string().max(400).describe("One plain, observable statement from the user's side"),
+            }),
+          )
+          .max(60)
+          .optional(),
+        change: z
+          .array(z.object({ id: z.string().describe("The criterion's id, e.g. c1a2b3"), text: z.string().max(400).optional(), area: z.string().max(60).optional() }))
+          .max(60)
+          .optional(),
+        remove: z.array(z.string()).max(60).optional().describe("Ids of criteria whose feature no longer exists"),
+      },
+      async (update) => {
+        const n = (a) => (Array.isArray(a) ? a.length : 0);
+        if (!update.summary && !n(update.add) && !n(update.change) && !n(update.remove)) return text("Nothing to update: give a summary, add, change or remove.");
+        emit({ kind: "spec_update", update });
+        return text(`Recorded (${n(update.add)} added, ${n(update.change)} changed, ${n(update.remove)} removed${update.summary ? ", summary updated" : ""}). The spec is updated when this version is saved.`);
+      },
+    ),
+    tool(
       "save_to_library",
       "Save a self-contained component to the team's component library so every project can reuse it. " +
         "Use it only when the user asks to save, share or reuse a component. List every file the component needs " +
@@ -298,9 +328,28 @@ const CURSOR_SCRIPT = `(() => {
     c.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 2l7.5 19 2.6-7.8L22 10.6z" fill="#111" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>';
     const s = document.createElement("style");
     s.textContent = "@keyframes __forgeRipple{from{transform:scale(.4);opacity:1}to{transform:scale(1.8);opacity:0}}";
-    document.documentElement.append(s, c);
+    // What the agent is doing, next to the cursor (it fades out a moment after the step).
+    const tag = document.createElement("div");
+    tag.setAttribute("aria-hidden", "true");
+    tag.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;max-width:320px;padding:4px 9px;border-radius:7px;background:rgba(17,19,24,.92);color:#fff;font:600 12px/1.35 system-ui,-apple-system,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0;transition:transform .45s cubic-bezier(.2,.8,.2,1),opacity .25s";
+    document.documentElement.append(s, c, tag);
+    let pos = [640, 400];
+    let hideTimer = 0;
+    const place = () => {
+      // Right of and below the cursor; flipped left/up near the window's edges.
+      const w = tag.offsetWidth || 160, h = tag.offsetHeight || 24;
+      const x = pos[0] + 22 + w > innerWidth - 8 ? pos[0] - w - 10 : pos[0] + 22;
+      const y = pos[1] + 26 + h > innerHeight - 8 ? pos[1] - h - 8 : pos[1] + 26;
+      tag.style.transform = "translate(" + Math.max(8, x) + "px," + Math.max(8, y) + "px)";
+    };
     window.__forgeCursor = {
-      move(x, y) { c.style.transform = "translate(" + x + "px," + y + "px)"; },
+      move(x, y) { c.style.transform = "translate(" + x + "px," + y + "px)"; pos = [x, y]; place(); },
+      label(text, ms) {
+        clearTimeout(hideTimer);
+        if (!text) { tag.style.opacity = "0"; return; }
+        tag.textContent = text; place(); tag.style.opacity = "1";
+        hideTimer = setTimeout(() => { tag.style.opacity = "0"; }, ms || 2600);
+      },
       click(x, y) {
         const r = document.createElement("div");
         r.setAttribute("aria-hidden", "true");
@@ -313,9 +362,17 @@ const CURSOR_SCRIPT = `(() => {
   if (document.documentElement) install(); else document.addEventListener("DOMContentLoaded", install);
 })();`;
 
-/** Glide the visible cursor to an element (and optionally show a click ripple). */
-async function pointAt(loc, click) {
+/** Show what the agent is doing next to the cursor (in the picture people watch). */
+async function showLabel(text, ms) {
   const p = await getPage();
+  await p.evaluate(([t, d]) => window.__forgeCursor?.label(t, d), [text, ms]).catch(() => undefined);
+}
+const nameOf = (t) => (t.name || t.label || t.text || (t.role ? `the ${t.role}` : "") || t.selector || "an element").trim().slice(0, 60);
+
+/** Glide the visible cursor to an element (and optionally show a click ripple), with a label. */
+async function pointAt(loc, click, label) {
+  const p = await getPage();
+  if (label) await showLabel(label, 3200);
   await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
   const box = await loc.boundingBox().catch(() => null);
   if (!box) return;
@@ -362,24 +419,26 @@ const qaTools = createSdkMcpServer({
     tool("open", "Open a path of the running app (e.g. / or /about) and return the page's accessibility tree.", { path: z.string() }, async ({ path }) => {
       const p = await getPage();
       const res = await p.goto(APP_URL + (path.startsWith("/") ? path : `/${path}`), { waitUntil: "load", timeout: 120_000 });
+      await showLabel(`Opened ${path.startsWith("/") ? path : `/${path}`}`, 2200);
       await p.waitForTimeout(1200);
       return snapshot(`HTTP ${res?.status() ?? "?"}`);
     }),
     tool("snapshot", "Return the current page's accessibility tree and any new console errors.", {}, async () => snapshot()),
     tool("click", "Click an element, then return the updated page.", target, async (t) => {
       const loc = await locate(t);
-      await pointAt(loc, true);
+      await pointAt(loc, true, `Clicking “${nameOf(t)}”`);
       await loc.click({ timeout: 5000 });
       await (await getPage()).waitForTimeout(800);
       return snapshot();
     }),
     tool("fill", "Type into a field (replacing its content), then return the updated page.", { ...target, value: z.string() }, async (t) => {
       const loc = await locate(t);
-      await pointAt(loc, true);
+      await pointAt(loc, true, `Typing “${String(t.value).slice(0, 30)}”`);
       await loc.fill(t.value, { timeout: 5000 });
       return snapshot();
     }),
     tool("press", "Press a key (e.g. Enter, Escape, Tab) on the focused element.", { key: z.string() }, async ({ key }) => {
+      await showLabel(`Pressing ${key}`, 2000);
       await (await getPage()).keyboard.press(key);
       await (await getPage()).waitForTimeout(600);
       return snapshot();
@@ -397,6 +456,7 @@ const qaTools = createSdkMcpServer({
       ].join(" "),
       {
         title: z.string().describe('What it checks, e.g. "Voting twice moves the Leading badge"'),
+        criterionId: z.string().optional().describe("The id of the spec criterion this test proves (e.g. c1a2b3), when it proves one"),
         steps: z
           .array(
             z.object({
@@ -427,6 +487,7 @@ const qaTools = createSdkMcpServer({
         actual: z.string(),
       },
       async (issue) => {
+        if (page) await showLabel(`Found a problem: ${String(issue.title).slice(0, 50)}`, 3500);
         emit({ kind: "qa_issue", issue });
         return text("Recorded.");
       },
@@ -453,13 +514,13 @@ try {
         ? ["Read", "Glob", "Grep", "TodoWrite", ...["open", "snapshot", "click", "fill", "press", "screenshot", "report_issue", "propose_test"].map((n) => `mcp__browser__${n}`)]
         : [
             "Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite", "WebFetch", "WebSearch",
-            "mcp__forge__ask_user", "mcp__forge__present_plan", "mcp__forge__save_to_library", "mcp__forge__look_at_page",
+            "mcp__forge__ask_user", "mcp__forge__present_plan", "mcp__forge__save_to_library", "mcp__forge__look_at_page", "mcp__forge__update_spec",
           ],
       // The QA agent tests; it never changes the app.
       disallowedTools: QA
         ? ["Write", "Edit", "Bash", "NotebookEdit", "WebFetch", "WebSearch"]
         : READ_ONLY
-          ? ["Write", "Edit", "Bash", "NotebookEdit", "mcp__forge__save_to_library", "mcp__forge__present_plan"]
+          ? ["Write", "Edit", "Bash", "NotebookEdit", "mcp__forge__save_to_library", "mcp__forge__present_plan", "mcp__forge__update_spec"]
           : AUTONOMOUS
             ? ["mcp__forge__present_plan", "mcp__forge__ask_user"]
             : undefined,

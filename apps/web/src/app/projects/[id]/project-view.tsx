@@ -1,10 +1,11 @@
 "use client";
 
 import { cleanRunError } from "@forge/protocol";
-import type { AppProblem, CommentAnchor, Project, ProjectComment, ProposedTest, ProjectModels, QueuedMessage, RunEvent, RunMode, SandboxStatus, TestInput } from "@forge/protocol";
+import type { AppProblem, CommentAnchor, Project, ProjectComment, ProposedTest, ProjectModels, QueuedMessage, RunEvent, RunMode, SandboxStatus, SaveTestInput } from "@forge/protocol";
 import { failedTestPrompt, StepList } from "./test-steps";
 import { HealthPanel } from "./health-panel";
 import { AgentWorking, currentActivity } from "./agent-working";
+import { QaLiveView } from "./qa-live";
 import { QueueList } from "./queue-list";
 import { PreviewOffline, usePreviewReachable } from "./preview-health";
 import { PlanPanel, PlanSummaryCard } from "./plan-panel";
@@ -44,6 +45,7 @@ import {
   Hammer,
   HeartPulse,
   History,
+  ScrollText,
   Info,
   Layers,
   Link2,
@@ -79,6 +81,7 @@ import { api, ApiError } from "@/lib/api";
 import { useProjectEvents } from "@/lib/use-project-events";
 import { ApisPicker } from "./apis-picker";
 import { BrainPanel } from "./brain-panel";
+import { SpecPanel } from "./spec-panel";
 import { PauseCard } from "./pause-card";
 import { VersionsPanel } from "./versions-panel";
 
@@ -193,7 +196,7 @@ export function ProjectView() {
   const [prompt, setPrompt] = useState("");
   const [sending, setSending] = useState(false);
   const [previewKey, setPreviewKey] = useState(0);
-  const { events, streaming, connected, caughtUp, qaFrame, presence, commentsVersion, problemsVersion, securityVersion, queueVersion, projectVersion, resync } =
+  const { events, streaming, connected, caughtUp, qaFrame, presence, commentsVersion, problemsVersion, securityVersion, reviewVersion, specVersion, queueVersion, projectVersion, resync } =
     useProjectEvents(id);
   // The project's details changed on the server (e.g. Forge gave it a better name): refresh them.
   useEffect(() => {
@@ -211,7 +214,7 @@ export function ProjectView() {
   const meId = session?.user.id;
   const feedEnd = useRef<HTMLDivElement>(null);
 
-  const [tab, setTab] = useState<"chat" | "comments" | "versions" | "brain" | "health">("chat");
+  const [tab, setTab] = useState<"chat" | "comments" | "versions" | "spec" | "brain" | "health">("chat");
   // Screen size: Responsive (fill, or a size set by dragging / typing) or a device preset.
   const viewport = useViewport();
   const [stage, setStage] = useState({ w: 1000, h: 700 });
@@ -633,7 +636,7 @@ export function ProjectView() {
   }, [id, problemsVersion]);
   const openProblems = problems?.filter((p) => p.status === "open").length ?? 0;
   // Saved tests change when they're replayed or the QA agent reports new proposals.
-  const pushCount = useMemo(() => events.filter((e) => e.type === "github.push" || e.type === "pull_request").length, [events]);
+  const pushCount = useMemo(() => events.filter((e) => e.type === "github.push" || e.type === "pull_request" || e.type === "github.sync").length, [events]);
   const testEvents = useMemo(() => events.filter((e) => e.type === "tests.result" || e.type === "qa.report").length, [events]);
   const pinsScroll = useRef(false);
   const [missingPins, setMissingPins] = useState<Set<string>>(() => new Set());
@@ -677,7 +680,7 @@ export function ProjectView() {
       });
     }
     const replies = t.replies.map((r) => `${r.userName}: ${r.body}`).join("\n");
-    setPrompt(`${t.body}${replies ? `\n\nDiscussion:\n${replies}` : ""}\n\n(From comment #${t.n} by ${t.userName}.)`);
+    setPrompt(`${t.body}${replies ? `\n\nDiscussion:\n${replies}` : ""}\n\n(From comment #${t.n} by ${t.userName}${t.guest ? ", a reviewer outside the team" : ""}.)`);
     setTab("chat");
   };
   useEffect(() => {
@@ -893,6 +896,7 @@ export function ProjectView() {
     { id: "chat", label: "Build", icon: Hammer },
     { id: "comments", label: "Comments", icon: MessagesSquare },
     { id: "versions", label: "Versions", icon: History },
+    { id: "spec", label: "Spec", icon: ScrollText },
     { id: "brain", label: "Brain", icon: Brain },
     { id: "health", label: "Health", icon: HeartPulse },
   ] as const;
@@ -959,6 +963,10 @@ export function ProjectView() {
               refreshKey={pushCount}
               onOpenHealth={() => {
                 setTab("health");
+                setPanelPrefs({ collapsed: false });
+              }}
+              onStarted={() => {
+                setTab("chat");
                 setPanelPrefs({ collapsed: false });
               }}
             />
@@ -1082,6 +1090,7 @@ export function ProjectView() {
               <VersionsPanel
                 projectId={id}
                 refreshKey={commitCount}
+                reviewKey={reviewVersion}
                 disabled={running || !canBuild}
                 onError={showError}
                 onCompare={(pair) => {
@@ -1089,6 +1098,10 @@ export function ProjectView() {
                   setView("changes");
                 }}
               />
+            </div>
+          ) : tab === "spec" ? (
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <SpecPanel projectId={id} canBuild={canBuild} running={running} refreshKey={specVersion + testEvents} onStarted={() => setTab("chat")} onError={showError} />
             </div>
           ) : tab === "brain" ? (
             <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1105,6 +1118,7 @@ export function ProjectView() {
                 onError={showError}
                 refreshKey={testEvents}
                 securityKey={securityVersion}
+                reviewKey={reviewVersion}
               />
             </div>
           ) : (
@@ -1370,6 +1384,7 @@ export function ProjectView() {
                 projectActions={[
                   { id: "comments", label: "Comments", run: () => setTab("comments") },
                   { id: "versions", label: "Versions", run: () => setTab("versions") },
+                  { id: "spec", label: "Spec (what the app does, acceptance criteria)", run: () => setTab("spec") },
                   { id: "brain", label: "Brain (project notes)", run: () => setTab("brain") },
                   { id: "health", label: "Health (problems, tests, security)", run: () => setTab("health") },
                   { id: "code", label: "Code", run: () => setView("code") },
@@ -1553,18 +1568,7 @@ export function ProjectView() {
             ) : view === "changes" ? (
               <CompareView projectId={id} pair={comparePair} onPair={setComparePair} previewUrl={sandbox?.previewUrl ?? null} refreshKey={commitCount} />
             ) : qaFrame && running ? (
-              <div className="pop mx-auto flex h-full max-w-5xl flex-col overflow-hidden bg-[#111318]">
-                <p className="flex items-center gap-2 px-3 py-1.5 text-xs text-[#e8eaef]">
-                  <span className="size-2 animate-pulse rounded-full bg-[#f26363]" />
-                  QA agent&apos;s browser (live)
-                </p>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={`data:image/jpeg;base64,${qaFrame.data}`}
-                  alt="Live view of the QA agent testing the app"
-                  className="min-h-0 w-full flex-1 object-contain"
-                />
-              </div>
+              <QaLiveView frame={qaFrame.data} events={events} runId={qaFrame.runId} />
             ) : sandbox?.previewUrl ? (
               <div ref={stageRef} className={`flex h-full gap-3 ${splitId ? "" : "justify-center"}`}>
               <div
@@ -2163,7 +2167,7 @@ function QaReport({
   disabled: boolean;
   onFix: (prompt: string) => void;
   /** Builders: keep a proposed test. */
-  onSaveTest?: (t: TestInput) => Promise<unknown>;
+  onSaveTest?: (t: SaveTestInput) => Promise<unknown>;
 }) {
   const fixPrompt = () =>
     [
@@ -2224,7 +2228,7 @@ function QaReport({
 }
 
 /** Tests the QA agent proposed; Forge replayed each once. Passing ones can be kept. */
-function ProposedTests({ tests, onSave }: { tests: ProposedTest[]; onSave?: (t: TestInput) => Promise<unknown> }) {
+function ProposedTests({ tests, onSave }: { tests: ProposedTest[]; onSave?: (t: SaveTestInput) => Promise<unknown> }) {
   const [saved, setSaved] = useState<Record<number, "saving" | "saved" | string>>({});
   return (
     <div className="flex flex-col gap-1.5">
@@ -2235,7 +2239,13 @@ function ProposedTests({ tests, onSave }: { tests: ProposedTest[]; onSave?: (t: 
             <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[13px] hover:bg-surface-2">
               <span className={t.result.ok ? "pill pill-ok" : "pill pill-bad"}>{t.result.ok ? "Passes" : "Failed replay"}</span>
               <span className="min-w-0 flex-1">{t.title}</span>
-              {onSave && t.result.ok && (
+              {t.criterionId && <span className="pill pill-pri text-[11px]" title="It proves an acceptance criterion in the Spec tab">Spec</span>}
+              {t.saved && (
+                <span className="pill pill-ok text-[11px]">
+                  <Check size={11} aria-hidden /> Saved
+                </span>
+              )}
+              {onSave && t.result.ok && !t.saved && (
                 <button
                   type="button"
                   className="btn btn-sm"
@@ -2243,7 +2253,7 @@ function ProposedTests({ tests, onSave }: { tests: ProposedTest[]; onSave?: (t: 
                   onClick={(ev) => {
                     ev.preventDefault();
                     setSaved((s) => ({ ...s, [n]: "saving" }));
-                    onSave({ title: t.title, steps: t.steps }).then(
+                    onSave({ title: t.title, steps: t.steps, ...(t.criterionId ? { criterionId: t.criterionId } : {}) }).then(
                       () => setSaved((s) => ({ ...s, [n]: "saved" })),
                       (err) => setSaved((s) => ({ ...s, [n]: err instanceof Error ? err.message : "Couldn't save" })),
                     );

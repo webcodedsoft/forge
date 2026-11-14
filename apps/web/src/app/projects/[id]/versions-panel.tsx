@@ -1,14 +1,15 @@
 "use client";
 
-import type { BranchesResponse, Version } from "@forge/protocol";
+import type { BranchesResponse, Version, VersionReviewSummary } from "@forge/protocol";
 import { Select } from "@/components/select";
-import { GitBranch, GitCompare, Lightbulb, RotateCcw, Trash2, LayoutTemplate } from "lucide-react";
+import { Eye, GitBranch, GitCompare, Lightbulb, RotateCcw, Trash2, LayoutTemplate } from "lucide-react";
 import { useEffect, useState } from "react";
 import { BusyLabel, SkeletonCards } from "@/components/loading";
 import { Pagination, usePagination } from "@/components/pagination";
 import { Modal, ModalActions } from "@/components/modal";
 import { api } from "@/lib/api";
 import type { ComparePair } from "./compare-view";
+import { VersionLook } from "./version-look";
 
 /**
  * Versions of the current line (main, or an idea), with: see what a version changed,
@@ -17,10 +18,13 @@ import type { ComparePair } from "./compare-view";
 export function VersionsPanel({
   projectId,
   refreshKey,
+  reviewKey,
   disabled,
   onError,
   onCompare,
 }: {
+  /** Bumps when a version's pictures are ready. */
+  reviewKey: number;
   projectId: string;
   /** Changes whenever a new commit lands or the line switches, so the list reloads. */
   refreshKey: number;
@@ -34,6 +38,19 @@ export function VersionsPanel({
   const [confirming, setConfirming] = useState<string | null>(null);
   const [ideaFrom, setIdeaFrom] = useState<string | null>(null);
   const [ideaName, setIdeaName] = useState("");
+  // Which pages look different per version (review.ts), and the version whose pictures are open.
+  const [reviews, setReviews] = useState<Map<string, VersionReviewSummary>>(() => new Map());
+  const [look, setLook] = useState<Version | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api.reviews(projectId).then(
+      (list) => !cancelled && setReviews(new Map(list.map((r) => [r.sha, r]))),
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, refreshKey, reviewKey]);
   // A new version goes back to page 1, where it appears.
   const pager = usePagination(versions, 10, refreshKey);
 
@@ -168,6 +185,8 @@ export function VersionsPanel({
       <ol className="space-y-2">
         {pager.items.map((v, i) => {
           const first = pager.from - 1 + i === versions.length - 1;
+          const review = reviews.get(v.sha);
+          const differs = review ? review.changed.length + review.added.length + review.removed.length : 0;
           return (
             <li key={v.sha} className="card p-3">
               <p className="line-clamp-2">{v.message}</p>
@@ -175,12 +194,24 @@ export function VersionsPanel({
                 <code className="font-mono">{v.sha.slice(0, 7)}</code> · {new Date(v.at).toLocaleString()}
                 {v.current && <span className="pill pill-pri">current</span>}
                 {first && <span className="pill">Starting point</span>}
+                {review?.baseSha && differs > 0 && (
+                  <span className="pill pill-warn" title={[...review.changed, ...review.added, ...review.removed].join(", ")}>
+                    {differs} page{differs === 1 ? "" : "s"} look{differs === 1 ? "s" : ""} different
+                  </span>
+                )}
+                {review?.baseSha && differs === 0 && <span className="pill">Looks the same</span>}
               </p>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {!first && (
                   <button type="button" className="btn btn-sm" onClick={() => onCompare({ from: `${v.sha}^`, to: v.sha })} data-tip="What this version changed">
                     <GitCompare size={13} aria-hidden />
                     Changes
+                  </button>
+                )}
+                {review && (
+                  <button type="button" className="btn btn-sm" onClick={() => setLook(v)} data-tip="Pictures of every page, next to the version before">
+                    <Eye size={13} aria-hidden />
+                    Look
                   </button>
                 )}
                 {!v.current && (
@@ -264,6 +295,7 @@ export function VersionsPanel({
         })}
       </ol>
       <Pagination pager={pager} noun="versions" compact />
+      {look && <VersionLook projectId={projectId} sha={look.sha} title={look.message} onClose={() => setLook(null)} />}
     </div>
   );
 }

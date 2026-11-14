@@ -72,7 +72,9 @@ These avoid 3000 and 8787, which other projects on this Mac already use.
   drives a real Chromium (open/snapshot/click/fill/press/screenshot) against the project's recent requests
   and the team brain, reports issues (`report_issue`), and ends with a QA report card ("Fix these issues"
   hands it to the build agent). While it runs, the builder shows its browser live (CDP screencast about
-  6 fps, not stored) with a drawn cursor that glides to each element and ripples on clicks.
+  6 fps, not stored) with a drawn cursor that glides to each element and ripples on clicks. A label next to the cursor
+  says what it is doing ("Clicking “Vote”", in `runner.mjs` `showLabel`), and under the live view a caption shows the
+  current step, the last three, and the step and problem counts (`qa-live.tsx`, built from the run's tool calls).
 - Phase 8 done: visual edit and usage. The preview proxy injects `/__forge/inspector.js` into HTML pages
   (fetched uncompressed); "Select element" in the preview toolbar highlights elements on hover and posts
   the clicked one (tag, text, section, DOM path, classes, HTML) to the builder via postMessage, restricted
@@ -197,6 +199,49 @@ These avoid 3000 and 8787, which other projects on this Mac already use.
   and wildcard preview routing; TLS via Let's Encrypt + Azure DNS, company CA, or Caddy's internal CA).
   Preview addresses come from `PREVIEW_URL_TEMPLATE`; the builder's websocket uses the same host when
   deployed. Images build and the Compose and Caddy configs validate; not yet run on the real servers.
+- Guest feedback on share links (`routes/comments.ts` `publicFeedback`, `preview/[projectId]/[token]/shared-preview.tsx`): a
+  preview share link (with "Let visitors leave feedback", `preview_share.allow_feedback`) lets someone without an account
+  pick an element on the shared page and leave a note under a name they type. Public endpoints under
+  `/api/public/preview-shares/:projectId/:token/comments` (the token is the access; 20 notes per 10 minutes and 300 in
+  total per link). Notes are `project_comment` rows with `user_id` null, `guest_name` and `share_id`; they show in Comments
+  marked Guest and builders may delete them. A visitor sees only the threads started through their own link, plus the
+  team's replies (polled every 20 s). Guest text reaches the agent only when a builder presses "Ask the agent to fix this"
+  and sends the prefilled request.
+- Share links can be copied again: each new link's token is kept AES-256-GCM encrypted (`preview_share.token_enc`, same
+  key as project secrets, bound to the project and link id) next to its SHA-256 hash, which is still what access is checked
+  against. The Share preview dialog lists active links with Copy (builders only). Links made before this have only the hash
+  and show "Can't be shown"; they keep working. Changing `FORGE_SECRETS_KEY` makes existing links uncopyable, not broken.
+- Version reviews: visual diffs and accessibility (`review.ts`, `routes/review.ts`, `version_review`). The smoke test in
+  `sandbox/checks/checks.mjs` also takes a screenshot of every static page at 1280 and 390 px (reduced motion, animations
+  off, up to 3,000 px tall) and runs axe-core (WCAG 2.1 A/AA) into `/tmp/forge-review`. On commit Forge copies that to
+  `data/reviews/<project>/<sha>/`, compares each picture with the nearest earlier reviewed version (pixelmatch; under 30
+  differing pixels counts as the same) and stores which pages changed, are new or are gone. Versions tab: "N pages look
+  different" and Look (before/after and a differences picture, desktop/phone). Health › Accessibility lists the latest
+  findings with Fix / Fix all / Check now; they never block saving or pushing. Versions saved without the checks (restore,
+  idea used, see below) are reviewed by `reviewVersion()` (`FORGE_ONLY=review`). The latest 40 reviews per project are kept.
+- Living spec (`spec.ts`, `routes/spec.ts`, `project_spec`, `spec_criterion`, builder Spec tab): a summary plus acceptance
+  criteria grouped by area. The build agent sees the spec in its system prompt, must keep criteria true, and records
+  changes with its `update_spec` tool; they are staged in memory and applied when the version is saved (dropped on
+  discard; applied straight away when the turn changed no files). Projects made in Forge get `docs/SPEC.md` written into
+  every saved version. The QA agent gets the criteria, may pass `criterionId` to `propose_test`, and saving such a test
+  links it (`spec_criterion.test_id`), so the criterion shows passing/failing from the test's last replay. Spec › "Write
+  tests" starts a QA run for up to 10 untested criteria and saves the passing tests itself; "Write the spec from the app"
+  starts a build run that only calls `update_spec`. The spec is not versioned: restoring an old version keeps today's spec.
+- GitHub round trip (`github-sync.ts`, `routes/github.ts` `githubSyncRoutes`, GitHub menu › `github-roundtrip.tsx`).
+  Changes on GitHub: `GET …/github/incoming` fetches the base branch into the host clone and lists the commits the
+  project's main line lacks; `POST …/github/pull` sends them into the sandbox as a git bundle, runs
+  `git merge --no-ff --no-commit`, and starts a run (`RunOptions` in `runs.ts`): no agent turn when the merge is clean,
+  a conflict-resolution turn otherwise; then the usual checks, and the merge is committed only when they pass (Discard
+  resets it). A `github.sync` event follows, which also tells the agent on its next turn that files changed. Review
+  feedback: `GET …/github/feedback` reads the pull request's unresolved review threads, review summaries, conversation and
+  checks over GraphQL (projects without a PR: checks on the pushed branch); `POST …/github/feedback/address` turns the
+  picked items (plus failing checks with the end of their Actions logs) into one build request and remembers what was
+  sent (`project.pr_feedback_sent`). Reviewer text is quoted and marked as untrusted in that request.
+- Test status of the four features above (2026-11-14): guest feedback, version reviews, the spec API and tab, a clean
+  merge from a local bare remote (merged, checked, saved, reviewed, `docs/SPEC.md` written) and reading feedback from a
+  public pull request all pass. Not yet run with a model, because the workspace's only AI key had no credits: the agent
+  calling `update_spec`, QA writing tests per criterion, the agent resolving merge conflicts (detection, cancel and
+  discard were tested), and addressing review feedback.
 - Next: phase 4b, Entra SSO (Forge sign-in, and the preview proxy injecting the teammate's API token as
   `x-forge-access-token`, which the generated proxy forwards as `Authorization: Bearer`). Waiting on
   tenant ID, the API scope and a Forge app registration.

@@ -3,6 +3,7 @@
 import type { RunEvent } from "@forge/protocol";
 import { Square } from "lucide-react";
 import { useEffect, useState } from "react";
+import { qaStep } from "./qa-live";
 
 /*
  * Shown at the bottom of the chat while the agent works: what it's doing right now (from the
@@ -37,7 +38,7 @@ export function currentActivity(events: RunEvent[], streaming: boolean): { title
     if (e.type === "tool.call" && !done.has(e.toolUseId)) {
       const summary = e.summary?.replace(/^attachment · /, "") || undefined;
       if (e.tool === "Bash") return { title: "Running a command", detail: summary };
-      if (e.tool.startsWith("mcp__browser__")) return { title: "Using the app", detail: summary };
+      if (e.tool.startsWith("mcp__browser__")) return { title: qaStep(e.tool, e.input)?.text ?? "Using the app" };
       return { title: VERBS[e.tool] ?? "Working", detail: summary };
     }
     if (e.type === "tool.result" || e.type === "assistant.message") break;

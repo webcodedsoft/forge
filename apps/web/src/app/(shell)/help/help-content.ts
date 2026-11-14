@@ -41,7 +41,7 @@ export const CATEGORIES: Category[] = [
         icon: "LayoutDashboard",
         summary: "Chat on the left, the live app on the right, and tabs for everything else.",
         body: [
-          "Build is where you talk to the agent. Comments, Versions, Brain and Health are tabs next to it.",
+          "Build is where you talk to the agent. Comments, Versions, Spec, Brain and Health are tabs next to it.",
           "The right side shows the running app (Preview), its files (Code) and what changed (Changes).",
           "The bar at the bottom of the chat shows what the agent is doing right now and how long it has been working.",
         ],
@@ -151,6 +151,29 @@ export const CATEGORIES: Category[] = [
         ],
       },
       {
+        id: "look",
+        title: "See what a version changed on screen",
+        icon: "Eye",
+        summary: "Forge takes a picture of every page with each version and marks the pages that look different.",
+        body: [
+          "Under Versions, a version says how many pages look different from the one before. Look opens the pictures: before and after, side by side, at desktop and phone size.",
+          "Differences shows the earlier picture faded with every changed pixel in pink, which is the quickest way to spot a change you didn't ask for.",
+          "Pictures are kept for the latest 40 versions. Pages with a changing address (such as /orders/123) and content that changes by itself (a clock, random data) aren't compared reliably.",
+        ],
+      },
+      {
+        id: "spec",
+        title: "The spec: what the app must keep doing",
+        icon: "ScrollText",
+        summary: "A summary and a list of acceptance criteria that the agent keeps current and QA tests against.",
+        body: [
+          "The Spec tab holds a short summary of the app and its acceptance criteria: things a user can do or see, grouped by area. The agent adds and updates them when its work changes what the app does, and has to keep every one true.",
+          "Write tests asks the QA agent to walk through criteria that have no test and save a test for each one that works. A criterion with a test shows Passing or Failing after every new version; Fix hands a failing one to the agent.",
+          "You can add, edit and remove criteria yourself. For an existing app without a spec, Write the spec from the app has the agent read the app and write it down.",
+          "Projects made in Forge also get the spec as docs/SPEC.md with every saved version, so it reaches GitHub with the code.",
+        ],
+      },
+      {
         id: "health",
         title: "Health: problems, tests and security",
         icon: "HeartPulse",
@@ -159,6 +182,7 @@ export const CATEGORIES: Category[] = [
           "Problems lists errors seen in the browser and on the server. Fix this (or Fix all) hands them to the agent.",
           "Saved tests replay after every version. Test the app sends a QA agent through the app in a real browser; Auto-test does this after each version within a daily budget.",
           "Security scans every version for leaked keys and risky code.",
+          "Accessibility lists what an automatic scan of every page found (contrast, missing labels, keyboard problems). It never blocks saving; Fix hands a problem to the agent.",
         ],
       },
       {
@@ -169,6 +193,17 @@ export const CATEGORIES: Category[] = [
         body: [
           "Click Comment, then any part of the app, to leave a pinned note. Teammates reply and resolve.",
           "Builders can send a comment to the agent with Ask the agent to fix this.",
+        ],
+      },
+      {
+        id: "guest-feedback",
+        title: "Feedback from people outside Forge",
+        icon: "MessageSquarePlus",
+        summary: "Anyone with a preview share link can pin feedback to the app, without an account.",
+        body: [
+          "More › Share preview link… (above the preview) creates a link. Every active link there has Copy, so you can send it again later. With Let visitors leave feedback on, the page behind it has a Leave feedback button: the visitor clicks a part of the app, writes a note and gives a name.",
+          "Their notes appear in Comments marked Guest, pinned to the same element. Reply there and the visitor sees your answer on the shared page; they see only the notes left through their own link.",
+          "Builders can remove guest notes. Turning the link off stops new feedback right away.",
         ],
       },
     ],
@@ -200,6 +235,18 @@ export const CATEGORIES: Category[] = [
           "Import from GitHub on the home page lists the organization's repositories. Changes to imported projects go back as a pull request.",
           "Pushing needs passing saved tests and a clean security scan; a project admin can override.",
         ],
+      },
+      {
+        id: "github-back",
+        title: "Changes and reviews coming back from GitHub",
+        icon: "ArrowDownToLine",
+        summary: "Bring in what engineers changed on GitHub, and hand review comments to the agent.",
+        body: [
+          "Once a project has a repository, the GitHub menu shows Changes on GitHub: the commits made there that the project doesn't have. Bring them in merges them into the project.",
+          "If they clash with what was built in Forge, the agent resolves the conflicts. Either way the result is saved as a version only when Forge's checks pass; otherwise you can keep fixing or discard it, and nothing is lost on GitHub.",
+          "Review feedback lists the pull request's open review comments and failing checks. Tick the ones you want and Send to the agent; when the new version is saved, send it to GitHub from the same menu.",
+        ],
+        tip: "Bring in GitHub's changes before pushing: Forge never overwrites work that was done on GitHub.",
       },
       {
         id: "library",
@@ -277,6 +324,10 @@ export const FAQ: { q: string; a: string }[] = [
   {
     q: "Why wasn't my change saved as a version?",
     a: "Forge saves only when its checks pass. The agent keeps fixing failures; if it can't, the chat shows “These changes are not saved yet”, where you can ask it to keep fixing or discard the changes.",
+  },
+  {
+    q: "Why does a version say pages look different when I only changed one thing?",
+    a: "Shared parts such as a header or a colour appear on many pages, so one change can show on all of them. Open Look and switch to Differences to see exactly which pixels changed.",
   },
   {
     q: "Can I undo something the agent did?",

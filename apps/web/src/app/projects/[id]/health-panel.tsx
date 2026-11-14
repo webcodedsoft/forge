@@ -1,7 +1,8 @@
 "use client";
 
-import type { AppProblem, SavedTest, SecurityFinding, SecurityReport } from "@forge/protocol";
+import type { A11yFinding, AppProblem, SavedTest, SecurityFinding, SecurityReport, VersionReview } from "@forge/protocol";
 import {
+  Accessibility,
   ChevronRight,
   EyeOff,
   FormInput,
@@ -32,6 +33,7 @@ import { api } from "@/lib/api";
  *   Problems  errors the running app produced (Fix from logs)
  *   Tests     saved tests, replayed after every new version
  *   Security  checks before pushing to GitHub
+ *   Accessibility  problems the scan of every page found (axe, WCAG 2.1 A/AA); never blocking
  * Failing tests and critical/high security findings block pushing to GitHub.
  */
 
@@ -65,7 +67,10 @@ export function HealthPanel({
   onError,
   refreshKey,
   securityKey,
+  reviewKey,
 }: {
+  /** Bumps when a version's review (accessibility scan) is ready. */
+  reviewKey: number;
   projectId: string;
   problems: AppProblem[] | null;
   canBuild: boolean;
@@ -83,7 +88,162 @@ export function HealthPanel({
       <ProblemsSection projectId={projectId} problems={problems} canBuild={canBuild} running={running} onStarted={onStarted} onError={onError} />
       <TestsSection projectId={projectId} canBuild={canBuild} running={running} onStarted={onStarted} onError={onError} refreshKey={refreshKey} />
       <SecuritySection projectId={projectId} canBuild={canBuild} running={running} onStarted={onStarted} onError={onError} refreshKey={securityKey} />
+      <AccessibilitySection projectId={projectId} canBuild={canBuild} running={running} onStarted={onStarted} onError={onError} refreshKey={reviewKey} />
     </div>
+  );
+}
+
+const IMPACT: Record<A11yFinding["impact"], string> = {
+  critical: "pill pill-bad",
+  serious: "pill pill-bad",
+  moderate: "pill pill-warn",
+  minor: "pill",
+};
+const IMPACT_ORDER: Record<A11yFinding["impact"], number> = { critical: 0, serious: 1, moderate: 2, minor: 3 };
+
+function AccessibilitySection({
+  projectId,
+  canBuild,
+  running,
+  onStarted,
+  onError,
+  refreshKey,
+}: {
+  projectId: string;
+  canBuild: boolean;
+  running: boolean;
+  onStarted: () => void;
+  onError: (msg: string) => void;
+  refreshKey: number;
+}) {
+  const [review, setReview] = useState<VersionReview | null | undefined>(undefined);
+  const [busy, setBusy] = useState<string | null>(null);
+  const findings = review ? [...review.a11y].sort((a, b) => IMPACT_ORDER[a.impact] - IMPACT_ORDER[b.impact] || a.route.localeCompare(b.route)) : undefined;
+  const pager = usePagination(findings, 8);
+  const seriousCount = findings?.filter((f) => f.impact === "critical" || f.impact === "serious").length ?? 0;
+
+  useEffect(() => {
+    let cancelled = false;
+    api.latestReview(projectId).then((r) => !cancelled && setReview(r), (e) => !cancelled && onError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, refreshKey, onError]);
+
+  async function act(key: string, fn: () => Promise<unknown>, started = false) {
+    setBusy(key);
+    try {
+      const r = await fn();
+      if (started) onStarted();
+      else if (r && typeof r === "object" && "a11y" in r) setReview(r as VersionReview);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section aria-labelledby="a11y-h" className="flex flex-col gap-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 id="a11y-h" className="h2 flex items-center gap-2">
+          <Accessibility size={16} className="text-ink-2" aria-hidden />
+          Accessibility
+        </h2>
+        {findings && findings.length > 0 && (seriousCount > 0 ? <span className="pill pill-bad">{seriousCount} serious</span> : <span className="pill pill-warn">{findings.length} minor</span>)}
+        {canBuild && (
+          <span className="ml-auto flex gap-1.5">
+            {findings && findings.length > 1 && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={running || busy !== null}
+                onClick={() => void act("fixall", () => api.fixA11y(projectId, "all"), true)}
+                data-tip={running ? "Wait for the agent to finish" : "One request to the agent for the most serious problems (up to 12)"}
+              >
+                <Wand2 size={13} aria-hidden />
+                Fix all
+              </button>
+            )}
+            <button type="button" className="btn btn-sm" disabled={running || busy !== null} onClick={() => void act("check", () => api.checkReview(projectId))}>
+              <ScanSearch size={13} aria-hidden />
+              {busy === "check" && <Spinner size={13} />}
+              {busy === "check" ? "Checking…" : "Check now"}
+            </button>
+          </span>
+        )}
+      </div>
+      <p className="lab">
+        Every page is scanned when a version is saved: contrast, missing labels and names, keyboard traps, wrong roles (WCAG 2.1 A and AA). An automatic
+        scan finds common problems, not all of them. It doesn&apos;t block saving or pushing.
+      </p>
+      {review === undefined ? (
+        <SkeletonCards n={2} />
+      ) : review === null ? (
+        <p className="card px-3 py-4 text-center text-ink-2">Not checked yet. It runs with the next saved version, or use Check now.</p>
+      ) : (
+        <>
+          <p className="lab">
+            Last check {new Date(review.at).toLocaleString()} on {review.sha.slice(0, 7)}
+            {!review.a11yChecked && " · the scan couldn't run on this version"}
+          </p>
+          {findings!.length === 0 ? (
+            review.a11yChecked && (
+              <p className="card flex items-center justify-center gap-2 px-3 py-4 text-ok">
+                <Accessibility size={16} aria-hidden />
+                No problems found.
+              </p>
+            )
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {pager.items.map((f) => (
+                <li key={f.id} className="card p-3">
+                  <p className="font-semibold leading-snug">{f.help}</p>
+                  <p className="lab mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className={`${IMPACT[f.impact]} capitalize`}>{f.impact}</span>
+                    <span className="font-mono">{f.route}</span>
+                    <span>
+                      {f.count} element{f.count === 1 ? "" : "s"}
+                    </span>
+                    {f.helpUrl && (
+                      <a href={f.helpUrl} target="_blank" rel="noreferrer" className="underline hover:text-ink">
+                        About this rule
+                      </a>
+                    )}
+                  </p>
+                  <details className="group mt-2">
+                    <summary className="flex cursor-pointer list-none items-center gap-1 text-xs text-ink-2 hover:text-ink">
+                      <ChevronRight size={12} className="transition-transform group-open:rotate-90" aria-hidden />
+                      Where
+                    </summary>
+                    <ul className="mt-1.5 flex flex-col gap-1.5">
+                      {f.nodes.map((n, i) => (
+                        <li key={i} className="rounded bg-surface-2 p-2 text-[11.5px] text-ink-2">
+                          <code className="block break-words font-mono">{n.html}</code>
+                          <span className="mt-1 block">{n.summary}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                  {canBuild && (
+                    <button
+                      type="button"
+                      className="btn btn-p btn-sm mt-2.5"
+                      disabled={running || busy !== null}
+                      onClick={() => void act(f.id, () => api.fixA11y(projectId, [f.id]), true)}
+                    >
+                      <Wand2 size={13} aria-hidden />
+                      Fix
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          <Pagination pager={pager} noun="problems" compact />
+        </>
+      )}
+    </section>
   );
 }
 

@@ -1,4 +1,4 @@
-import type { PreviewShare, PreviewShareDuration } from "@forge/protocol";
+import type { PreviewShare, PreviewShareDuration, SharedPreviewInfo } from "@forge/protocol";
 import { createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
@@ -6,12 +6,15 @@ import { nanoid } from "nanoid";
 import { db, schema } from "./db/index.ts";
 import { env } from "./env.ts";
 import { previewUrl } from "./sandbox.ts";
+import { decrypt, encrypt } from "./secrets.ts";
 
 /*
  * Who may see a project's preview (preview.ts checks every request):
  *   team members   the builder fetches a short-lived entry link (/__forge/enter?t=…) for the
  *                  project it shows; opening it sets a pass cookie on that preview host.
  *   share links    /__forge/share/<token> lets anyone in until the link expires or is revoked.
+ *                  The token is looked up by its hash; it is also kept encrypted (bound to the
+ *                  project and link) so builders can copy the link again from the Share dialog.
  * The pass is a signed cookie, valid only on its project's preview host. Inside the builder's
  * iframe (a different site in local development) it's a partitioned cross-site cookie; opened
  * on its own it's a normal one.
@@ -91,6 +94,19 @@ export function readCookie(req: IncomingMessage, name: string): string | undefin
 
 const hash = (token: string) => createHash("sha256").update(token).digest("hex");
 
+const shareUrl = (projectId: string, token: string) => `${new URL(env.BETTER_AUTH_URL).origin}/preview/${projectId}/${token}`;
+const tokenAad = (projectId: string, shareId: string) => `preview-share/${projectId}/${shareId}`;
+
+/** The link, when Forge kept its token (links made before that only have a hash). */
+function storedUrl(r: typeof schema.previewShare.$inferSelect): string | undefined {
+  if (!r.tokenEnc) return undefined;
+  try {
+    return shareUrl(r.projectId, decrypt(r.tokenEnc, tokenAad(r.projectId, r.id)));
+  } catch {
+    return undefined; // a different FORGE_SECRETS_KEY: the link still works, it just can't be shown
+  }
+}
+
 const toShare = (r: typeof schema.previewShare.$inferSelect): PreviewShare => ({
   id: r.id,
   label: r.label,
@@ -100,24 +116,35 @@ const toShare = (r: typeof schema.previewShare.$inferSelect): PreviewShare => ({
   revokedAt: r.revokedAt?.toISOString() ?? null,
   lastUsedAt: r.lastUsedAt?.toISOString() ?? null,
   uses: r.uses,
+  allowFeedback: r.allowFeedback,
+  url: storedUrl(r),
 });
 
-export async function createShare(projectId: string, duration: PreviewShareDuration, label: string | undefined, by: string): Promise<PreviewShare> {
+export async function createShare(
+  projectId: string,
+  duration: PreviewShareDuration,
+  label: string | undefined,
+  by: string,
+  allowFeedback = true,
+): Promise<PreviewShare> {
   const token = randomBytes(24).toString("base64url");
+  const id = nanoid(10);
   const [row] = await db
     .insert(schema.previewShare)
     .values({
-      id: nanoid(10),
+      id,
       projectId,
       tokenHash: hash(token),
+      tokenEnc: encrypt(token, tokenAad(projectId, id)),
       label: label?.trim() || null,
+      allowFeedback,
       createdBy: by,
       expiresAt: new Date(Date.now() + DURATION_MS[duration]),
     })
     .returning();
   // Shared as /preview/<projectId>/<token> on Forge's own address (index.ts), which leads to the
   // preview host's /__forge/share/<token>.
-  return { ...toShare(row!), url: `${new URL(env.BETTER_AUTH_URL).origin}/preview/${projectId}/${token}` };
+  return { ...toShare(row!), url: shareUrl(projectId, token) };
 }
 
 /** Links that still work (not expired or revoked), newest first. */
@@ -170,12 +197,24 @@ export async function shareStillValid(shareId: string): Promise<boolean> {
  * the project's name, when the link expires, and the frame address. The use is counted when the
  * frame opens the link, not here.
  */
-export async function describeShare(projectId: string, token: string): Promise<{ projectName: string; expiresAt: string; frameUrl: string } | null> {
+export async function describeShare(projectId: string, token: string): Promise<SharedPreviewInfo | null> {
   const [row] = await db
     .select({ share: schema.previewShare, name: schema.project.name })
     .from(schema.previewShare)
     .innerJoin(schema.project, eq(schema.project.id, schema.previewShare.projectId))
     .where(eq(schema.previewShare.tokenHash, hash(token)));
   if (!row || row.share.projectId !== projectId || row.share.revokedAt || row.share.expiresAt.getTime() <= Date.now()) return null;
-  return { projectName: row.name, expiresAt: row.share.expiresAt.toISOString(), frameUrl: `${previewOrigin(projectId)}/__forge/share/${token}` };
+  return {
+    projectName: row.name,
+    expiresAt: row.share.expiresAt.toISOString(),
+    frameUrl: `${previewOrigin(projectId)}/__forge/share/${token}`,
+    feedback: row.share.allowFeedback,
+  };
+}
+
+/** A working share link by its token (for guest feedback), or null. */
+export async function shareForToken(projectId: string, token: string): Promise<{ id: string; label: string | null; allowFeedback: boolean } | null> {
+  const [row] = await db.select().from(schema.previewShare).where(eq(schema.previewShare.tokenHash, hash(token)));
+  if (!row || row.projectId !== projectId || row.revokedAt || row.expiresAt.getTime() <= Date.now()) return null;
+  return { id: row.id, label: row.label, allowFeedback: row.allowFeedback };
 }

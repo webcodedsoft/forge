@@ -1,9 +1,13 @@
 "use client";
 
 import {
+  ArrowDownToLine,
   Brain,
   ChevronDown,
   Database,
+  Eye,
+  MessageSquarePlus,
+  ScrollText,
   GitBranch,
   Globe,
   Hammer,
@@ -32,6 +36,10 @@ import { useMemo, useState } from "react";
 import { type Article, CATEGORIES, FAQ, SHORTCUTS } from "./help-content";
 
 const ICONS: Record<string, LucideIcon> = {
+  ArrowDownToLine,
+  Eye,
+  MessageSquarePlus,
+  ScrollText,
   Brain,
   Database,
   GitBranch,

@@ -4,6 +4,10 @@ import { appendEvent } from "./events.ts";
 import { activeRunId, RunConflictError } from "./runs.ts";
 import { ensureComparePort, ensureSandbox, exec, previewUrl } from "./sandbox.ts";
 import { secretEnv } from "./secrets.ts";
+import { reviewVersion } from "./review.ts";
+
+/** A version saved without the checks still gets its screenshots and accessibility scan. */
+const reviewLater = (projectId: string, sha: string) => void reviewVersion(projectId, sha).catch((e) => console.error("version review failed", e));
 
 /*
  * Versions are the commits in the project's repo. Restoring never rewrites
@@ -73,6 +77,7 @@ export async function restoreVersion(projectId: string, sha: string, user: { nam
     restoredFrom: target,
     userName: user.name,
   });
+  reviewLater(projectId, newSha);
   return { sha: newSha, changed: true };
 }
 
@@ -140,7 +145,7 @@ export async function fileDiff(projectId: string, fromRef: string, toRef: string
 const BRANCH = /^[a-z0-9][a-z0-9-]{0,39}$/;
 export type Branch = { name: string; sha: string; at: string; current: boolean; main: boolean };
 
-async function mainBranch(projectId: string): Promise<string> {
+export async function mainBranch(projectId: string): Promise<string> {
   const set = await exec(projectId, ["git", "config", "--get", "forge.mainBranch"]);
   if (set.exitCode === 0 && set.stdout.trim()) return set.stdout.trim();
   const cur = await exec(projectId, ["git", "symbolic-ref", "--short", "HEAD"]);
@@ -248,7 +253,9 @@ export async function useBranch(projectId: string, name: string, user: { name: s
   ]);
   const out = r.stdout.trim();
   if (out !== "NOCHANGE") {
-    await appendEvent({ type: "commit", projectId, runId: `idea-${nanoid(8)}`, sha: out.split("\n").pop()!, message, userName: user.name });
+    const sha = out.split("\n").pop()!;
+    await appendEvent({ type: "commit", projectId, runId: `idea-${nanoid(8)}`, sha, message, userName: user.name });
+    reviewLater(projectId, sha);
   }
   await appendEvent({ type: "branch", projectId, runId: `branch-${nanoid(8)}`, action: "used", branch: name, userName: user.name });
 }

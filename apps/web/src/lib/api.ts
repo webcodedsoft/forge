@@ -12,9 +12,14 @@ import type {
   IntegrationsStatus,
   GitHubReposResponse,
   GitHubStatus,
+  GitHubIncoming,
+  PrFeedback,
   SecurityReport,
+  VersionReview,
+  VersionReviewSummary,
+  ProjectSpec,
+  SaveTestInput,
   SavedTest,
-  TestInput,
   TestRunResult,
   VersionCompare,
   ActivityResponse,
@@ -99,7 +104,7 @@ export const api = {
       `/projects/${encodeURIComponent(id)}/preview-access?${new URLSearchParams({ ...(opts.compare ? { compare: "1" } : {}), next: opts.next ?? "/" })}`,
     ),
   previewShares: (id: string) => request<{ shares: PreviewShare[] }>(`/projects/${encodeURIComponent(id)}/preview-shares`).then((r) => r.shares),
-  createPreviewShare: (id: string, input: { duration: PreviewShareDuration; label?: string }) =>
+  createPreviewShare: (id: string, input: { duration: PreviewShareDuration; label?: string; allowFeedback?: boolean }) =>
     request<PreviewShare>(`/projects/${encodeURIComponent(id)}/preview-shares`, { method: "POST", body: JSON.stringify(input) }),
   revokePreviewShare: (id: string, sid: string) =>
     request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/preview-shares/${encodeURIComponent(sid)}`, { method: "DELETE" }),
@@ -292,7 +297,7 @@ export const api = {
     }),
   clearSettledProblems: (id: string) => request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/problems/settled`, { method: "DELETE" }),
   tests: (id: string) => request<SavedTest[]>(`/projects/${encodeURIComponent(id)}/tests`),
-  saveTest: (id: string, input: TestInput) =>
+  saveTest: (id: string, input: SaveTestInput) =>
     request<SavedTest>(`/projects/${encodeURIComponent(id)}/tests`, { method: "POST", body: JSON.stringify(input) }),
   deleteTest: (id: string, testId: string) =>
     request<{ ok: true }>(`/projects/${encodeURIComponent(id)}/tests/${encodeURIComponent(testId)}`, { method: "DELETE" }),
@@ -307,12 +312,39 @@ export const api = {
   scanSecurity: (id: string) => request<SecurityReport>(`/projects/${encodeURIComponent(id)}/security/scan`, { method: "POST" }),
   fixSecurity: (id: string, ids: string[] | "all") =>
     request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/security/fix`, { method: "POST", body: JSON.stringify({ ids }) }),
+  spec: (id: string) => request<ProjectSpec>(`/projects/${encodeURIComponent(id)}/spec`),
+  setSpecSummary: (id: string, summary: string) =>
+    request<ProjectSpec>(`/projects/${encodeURIComponent(id)}/spec`, { method: "PATCH", body: JSON.stringify({ summary }) }),
+  addCriterion: (id: string, input: { area: string; text: string }) =>
+    request<ProjectSpec>(`/projects/${encodeURIComponent(id)}/spec/criteria`, { method: "POST", body: JSON.stringify(input) }),
+  updateCriterion: (id: string, cid: string, input: { area?: string; text?: string; testId?: string | null }) =>
+    request<ProjectSpec>(`/projects/${encodeURIComponent(id)}/spec/criteria/${encodeURIComponent(cid)}`, { method: "PATCH", body: JSON.stringify(input) }),
+  deleteCriterion: (id: string, cid: string) =>
+    request<ProjectSpec>(`/projects/${encodeURIComponent(id)}/spec/criteria/${encodeURIComponent(cid)}`, { method: "DELETE" }),
+  /** The QA agent writes tests for criteria without one (all, or the given ids). */
+  coverSpec: (id: string, ids?: string[]) =>
+    request<{ runId: string; count: number }>(`/projects/${encodeURIComponent(id)}/spec/cover`, { method: "POST", body: JSON.stringify(ids ? { ids } : {}) }),
+  draftSpec: (id: string) => request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/spec/draft`, { method: "POST" }),
+  reviews: (id: string) => request<VersionReviewSummary[]>(`/projects/${encodeURIComponent(id)}/reviews`),
+  review: (id: string, sha: string) => request<VersionReview>(`/projects/${encodeURIComponent(id)}/reviews/${encodeURIComponent(sha)}`),
+  latestReview: (id: string) => request<VersionReview | null>(`/projects/${encodeURIComponent(id)}/reviews/latest`),
+  checkReview: (id: string) => request<VersionReview>(`/projects/${encodeURIComponent(id)}/reviews/check`, { method: "POST" }),
+  reviewImageUrl: (id: string, sha: string, name: string) =>
+    `/api/projects/${encodeURIComponent(id)}/reviews/${encodeURIComponent(sha)}/image/${encodeURIComponent(name)}`,
+  fixA11y: (id: string, ids: string[] | "all") =>
+    request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/a11y/fix`, { method: "POST", body: JSON.stringify({ ids }) }),
   gitHub: (id: string) => request<GitHubStatus>(`/projects/${encodeURIComponent(id)}/github`),
   pushToGitHub: (id: string, input: { name?: string; override?: boolean }) =>
     request<{ url: string; repo: string; created: boolean; commits: number; pullRequest?: boolean }>(
       `/projects/${encodeURIComponent(id)}/github/push`,
       { method: "POST", body: JSON.stringify(input) },
     ),
+  gitHubIncoming: (id: string) => request<GitHubIncoming>(`/projects/${encodeURIComponent(id)}/github/incoming`),
+  pullFromGitHub: (id: string) =>
+    request<{ runId: string; commits: number; conflicts: string[] }>(`/projects/${encodeURIComponent(id)}/github/pull`, { method: "POST" }),
+  gitHubFeedback: (id: string) => request<PrFeedback>(`/projects/${encodeURIComponent(id)}/github/feedback`),
+  addressGitHubFeedback: (id: string, input: { ids: string[]; checks?: boolean }) =>
+    request<{ runId: string; points: number }>(`/projects/${encodeURIComponent(id)}/github/feedback/address`, { method: "POST", body: JSON.stringify(input) }),
   importFigma: (id: string, url: string) =>
     request<{ attachments: { path: string; name: string; type: string }[] }>(`/projects/${encodeURIComponent(id)}/figma`, {
       method: "POST",
