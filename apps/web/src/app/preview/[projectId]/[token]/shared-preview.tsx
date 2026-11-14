@@ -75,7 +75,7 @@ export function SharedPreview() {
 
   const threads = useMemo<Thread[]>(() => {
     const roots = comments.filter((c) => !c.parentId);
-    return roots.map((r, i) => ({ ...r, n: i + 1, replies: comments.filter((c) => c.parentId === r.id) }));
+    return roots.map((r, i) => ({ ...r, n: r.n ?? i + 1, replies: comments.filter((c) => c.parentId === r.id) }));
   }, [comments]);
 
   const load = useCallback(() => {

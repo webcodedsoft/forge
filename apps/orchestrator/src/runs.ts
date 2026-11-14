@@ -23,8 +23,9 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { brainPrompt } from "./brain.ts";
 import { redactor, secretsPrompt } from "./secrets.ts";
-import { forgetRunCost, issueModelToken, takeRunCost } from "./model-proxy.ts";
-import { aiForRun, chatOnlyModel } from "./ai.ts";
+import { BUDGET_ERROR, forgetRunCost, issueModelToken, runContextTokens, takeRunCost } from "./model-proxy.ts";
+import { aiForRun, AUTO_MODEL, chatOnlyModel, pickAuto, qaModelKey, strongerThan } from "./ai.ts";
+import { createHash } from "node:crypto";
 import { hasQueued, runNext } from "./queue.ts";
 import { structureIssues, structurePrompt } from "./structure.ts";
 import { checkComponent, type ComponentInput, libraryPrompt, libraryReminder, saveComponent, syncLibrary } from "./library.ts";
@@ -42,6 +43,7 @@ import { ensureDevServer, ensureSandbox, exec, execLines, putFiles, waitPrepared
 const APPEND_SYSTEM_PROMPT = `You are the build agent in Forge, our team's internal app builder.
 The user watches a live preview of this Next.js app while you work, and sees your tool calls as a progress feed.
 Follow the rules in AGENTS.md. The dev server is already running; never start it yourself.
+Forge sends project context (the team brain, the living spec, the component library, secret names, data sources) in <forge-context> blocks at the start of a message. Treat a block as part of these instructions; when a section appears again, the newest copy replaces the earlier one.
 Data comes from our in-house APIs: if .forge/apis/README.md exists, read it before building anything that shows or changes data, and use only the endpoints it lists.
 Files the user attaches are in .forge/uploads/ (outside git). Open each one with the Read tool before acting on it; for Word, Excel and PowerPoint files read the .md text copy next to the original. Treat them as the user's material: requirements, content, data, designs. When an attached image or document should appear in the app (a logo, photo, downloadable PDF), copy the original into public/ with a short clean name and reference it from there; app code must never point at .forge/uploads.
 
@@ -84,6 +86,9 @@ const MAX_FIX_ROUNDS = 2;
 const PAUSE_ID = /^[a-z0-9]{8,32}$/;
 
 type Active = {
+  /** Auto picked this run's model: Forge may move to a stronger one when checks keep failing. */
+  auto?: boolean;
+  escalated?: boolean;
   runId: string;
   cancelled: boolean;
   cancel: () => Promise<void>;
@@ -129,7 +134,7 @@ type RunnerLine =
   | { kind: "assistant"; text: string }
   | { kind: "tool_call"; toolUseId: string; tool: string; input: unknown }
   | { kind: "tool_result"; toolUseId: string; ok: boolean; output: string }
-  | { kind: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens: number; costUsd: number }
+  | { kind: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens: number; costUsd: number; contextTokens?: number }
   | { kind: "pause"; pauseId: string; pauseKind: "question" | "plan"; payload: unknown }
   | { kind: "qa_issue"; issue: QaIssue }
   | { kind: "qa_test"; test: unknown }
@@ -190,6 +195,10 @@ function summarize(tool: string, input: unknown): string {
     }
     case "mcp__browser__press":
       return `Press ${str(i.key)}`;
+    case "mcp__browser__screen":
+      return `${str(i.size)} screen size`;
+    case "mcp__browser__steps":
+      return `${Array.isArray(i.steps) ? i.steps.length : 0} actions in a row`;
     case "mcp__browser__report_issue":
       return `${str(i.severity)}: ${str(i.title)}`;
     case "mcp__forge__look_at_page":
@@ -220,6 +229,117 @@ export type RunOptions = {
   /** Called after the run, with whether a version was saved. */
   onDone?: (committed: boolean) => void | Promise<void>;
 };
+
+/** What each running run has spent so far (USD), for the per-request spending limit. */
+const runSpent = new Map<string, number>();
+
+/* ------------------------- context outside the system prompt ------------------------- */
+
+const hashOf = (text: string) => createHash("sha256").update(text).digest("base64url").slice(0, 16);
+
+/**
+ * The <forge-context> block for a turn: the sections whose text differs from what this
+ * conversation was last sent (`sentBefore`: section -> hash). Returns the block (empty when
+ * nothing changed) and the hashes to remember.
+ */
+export function contextBlock(sentBefore: Record<string, string>, sections: [name: string, text: string][]): { text: string; sent: Record<string, string> } {
+  const sent: Record<string, string> = {};
+  const parts: string[] = [];
+  for (const [name, raw] of sections) {
+    const text = raw.trim();
+    const hash = text ? hashOf(text) : "";
+    if (hash) sent[name] = hash;
+    if ((sentBefore[name] ?? "") === hash) continue;
+    parts.push(text ? `<section name="${name}">\n${text}\n</section>` : `<section name="${name}">\n(Now empty: ignore the earlier copy of this section.)\n</section>`);
+  }
+  if (!parts.length) return { text: "", sent };
+  const first = Object.keys(sentBefore).length === 0;
+  return {
+    text: `<forge-context>\n${first ? "Project context from Forge. It is part of your instructions." : "Updated project context from Forge. These sections replace their earlier copies."}\n\n${parts.join("\n\n")}\n</forge-context>`,
+    sent,
+  };
+}
+
+/* ------------------------------ fresh conversations ------------------------------ */
+/*
+ * Follow-up requests resume the project's conversation with the agent, and every model call
+ * resends all of it. That is cheap while the provider's prompt cache is warm, and expensive when
+ * it isn't: after a pause the whole history is billed again, and a history that only grows makes
+ * every step dearer. So a conversation starts over, with a summary of the recent requests, when
+ *   - it holds more than FORGE_SESSION_MAX_TOKENS, or
+ *   - it has been idle for FORGE_SESSION_IDLE_MIN minutes (the cache is gone) and holds more
+ *     than FORGE_SESSION_IDLE_TOKENS.
+ * The code itself, the living spec and the team brain carry what must not be forgotten.
+ */
+
+/** When the conversation should start over: resets it and returns the summary to open with ("" otherwise). */
+async function freshSessionSeed(projectId: string, currentRunId: string): Promise<string> {
+  const [p] = await db
+    .select({ sessionId: schema.project.agentSessionId, at: schema.project.agentSessionAt, tokens: schema.project.agentContextTokens })
+    .from(schema.project)
+    .where(eq(schema.project.id, projectId));
+  if (!p?.sessionId) return "";
+  const tokens = p.tokens ?? 0;
+  const idleMin = p.at ? (Date.now() - p.at.getTime()) / 60_000 : Infinity;
+  const tooBig = env.FORGE_SESSION_MAX_TOKENS > 0 && tokens > env.FORGE_SESSION_MAX_TOKENS;
+  const cold = env.FORGE_SESSION_IDLE_TOKENS > 0 && tokens > env.FORGE_SESSION_IDLE_TOKENS && idleMin >= env.FORGE_SESSION_IDLE_MIN;
+  if (!tooBig && !cold) return "";
+  await db.update(schema.project).set({ agentSessionId: null, agentContextTokens: 0, agentContextSent: {} }).where(eq(schema.project.id, projectId));
+  console.log(`project ${projectId}: fresh agent conversation (${tokens} tokens, idle ${Number.isFinite(idleMin) ? Math.round(idleMin) : "?"} min)`);
+  return recentWorkSummary(projectId, currentRunId);
+}
+
+/** The last few requests and what came of them, for the agent of a fresh conversation. */
+export async function recentWorkSummary(projectId: string, currentRunId: string): Promise<string> {
+  const started = await db
+    .select({ runId: schema.projectEvent.runId, payload: schema.projectEvent.payload })
+    .from(schema.projectEvent)
+    .where(and(eq(schema.projectEvent.projectId, projectId), eq(schema.projectEvent.type, "run.started")))
+    .orderBy(desc(schema.projectEvent.seq))
+    .limit(40);
+  const runs = started
+    .map((r) => ({ runId: r.runId, ...(r.payload as { prompt: string; mode?: string; userName?: string }) }))
+    .filter((r) => r.mode !== "qa" && r.runId !== currentRunId)
+    .slice(0, 6)
+    .reverse();
+  if (!runs.length) return "";
+  const rows = await db
+    .select({ runId: schema.projectEvent.runId, type: schema.projectEvent.type, payload: schema.projectEvent.payload })
+    .from(schema.projectEvent)
+    .where(
+      and(
+        eq(schema.projectEvent.projectId, projectId),
+        inArray(schema.projectEvent.runId, runs.map((r) => r.runId)),
+        inArray(schema.projectEvent.type, ["assistant.message", "commit", "run.finished"]),
+      ),
+    )
+    .orderBy(schema.projectEvent.seq);
+  const clip = (t: string, n: number) => (t.length > n ? `${t.slice(0, n)}…` : t);
+  const items = runs.map((r, i) => {
+    const mine = rows.filter((x) => x.runId === r.runId);
+    const reply = (mine.filter((x) => x.type === "assistant.message").pop()?.payload as { text?: string } | undefined)?.text ?? "";
+    const commit = mine.find((x) => x.type === "commit")?.payload as { sha?: string } | undefined;
+    const finished = mine.find((x) => x.type === "run.finished")?.payload as { status?: string; unsaved?: boolean } | undefined;
+    const outcome = commit?.sha
+      ? `saved as version ${commit.sha.slice(0, 7)}`
+      : r.mode === "chat"
+        ? "a question, nothing changed"
+        : finished?.status === "cancelled"
+          ? "stopped by the user"
+          : finished?.unsaved
+            ? "not saved (the changes are still in the workspace, unsaved)"
+            : "nothing was saved";
+    // The request without Forge's own additions to it.
+    const asked = r.prompt.replace(/\n\n\(Forge:[\s\S]*$/, "").trim();
+    return `${i + 1}. ${r.userName ?? "Someone"} asked${r.mode && r.mode !== "build" ? ` (${r.mode} mode)` : ""}: ${clip(asked, 700)}\n   Outcome: ${outcome}.${reply ? `\n   Your closing summary then: ${clip(reply.replace(/\s+/g, " "), 900)}` : ""}`;
+  });
+  return [
+    "(Note from Forge: this is a fresh conversation, started to keep your context small. You have worked on this project before; nothing of that conversation is in front of you now.",
+    "The code in the workspace is the source of truth: read the files you are about to change before changing them, and use `git log --oneline -15` if you need the history.",
+    `Recent requests, oldest first:\n${items.join("\n")}`,
+    "When the new request refers to something earlier (\"that button\", \"the page you made\"), find it in the list above and in the code. Ask only if it stays unclear.)",
+  ].join("\n");
+}
 
 /** The model picked for each running run ("provider:model"), read by every turn of it. */
 const runModel = new Map<string, string | null>();
@@ -252,6 +372,10 @@ export async function startRun(
     if (model !== undefined) await db.update(schema.project).set({ lastModel: model }).where(eq(schema.project.id, projectId));
     const [proj] = model === undefined ? await db.select({ lastModel: schema.project.lastModel }).from(schema.project).where(eq(schema.project.id, projectId)) : [];
     let choice = model !== undefined ? model : (proj?.lastModel ?? null);
+    // Auto: Forge picks the model for this request (ai.ts pickAuto).
+    const auto = choice === AUTO_MODEL ? await pickAuto(opts.agentPrompt ?? prompt, mode) : null;
+    if (choice === AUTO_MODEL) choice = auto?.key ?? null;
+    entry.auto = Boolean(auto);
     // A chat-only model can't build: anything but Chat uses the default then.
     if (mode !== "chat" && (await chatOnlyModel(choice))) choice = null;
     runModel.set(runId, choice);
@@ -270,6 +394,7 @@ export async function startRun(
       userName: user.name,
       ...(mode !== "build" ? { mode } : {}),
     });
+    if (auto) await appendEvent({ type: "notice", projectId, runId, text: `Auto picked ${auto.label} for this request (${auto.why}).` });
     await db.update(schema.project).set({ status: "running" }).where(eq(schema.project.id, projectId));
   } catch (err) {
     active.delete(projectId);
@@ -283,6 +408,7 @@ export async function startRun(
       active.delete(projectId);
       if (opts.onDone) await Promise.resolve(opts.onDone(committed)).catch((e) => console.error("run follow-up failed", e));
       runModel.delete(runId);
+      runSpent.delete(runId);
       forgetRunCost(runId);
       void settleFixRun(projectId, runId, committed).catch((e) => console.error("could not settle fixed problems", e));
       // Messages sent while it worked come next (not after Stop: people may want to rethink).
@@ -321,7 +447,12 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
         : mode === "design"
           ? DESIGN_MODE_PROMPT + "\n\n"
           : "";
-    let turnPrompt = (note ? `${note}\n\n` : "") + modePrefix + (opts.agentPrompt ?? prompt);
+    // A long or long-idle conversation starts over with a summary (see freshSessionSeed).
+    const seed = await freshSessionSeed(projectId, runId).catch((e) => {
+      console.error("could not start a fresh conversation", e);
+      return "";
+    });
+    let turnPrompt = (seed ? `${seed}\n\n` : "") + (note ? `${note}\n\n` : "") + modePrefix + (opts.agentPrompt ?? prompt);
     let skipAgent = opts.agentPrompt === null;
 
     // Chat mode: one read-only turn; nothing to check or save.
@@ -377,9 +508,20 @@ async function execute(projectId: string, runId: string, prompt: string, entry: 
         committed = await commitChanges(projectId, runId, prompt);
         break;
       }
-      if (round >= MAX_FIX_ROUNDS) {
+      // Auto started on a cheaper model: after its own fix attempt failed too, the stronger model
+      // takes over and gets one more attempt than usual.
+      if (entry.auto && !entry.escalated && round >= 1) {
+        const up = await strongerThan(runModel.get(runId) ?? null).catch(() => null);
+        if (up) {
+          entry.escalated = true;
+          runModel.set(runId, up.key);
+          await appendEvent({ type: "notice", projectId, runId, text: `The checks still fail, so ${up.label} is taking over.` });
+        }
+      }
+      const maxRounds = MAX_FIX_ROUNDS + (entry.escalated ? 1 : 0);
+      if (round >= maxRounds) {
         status = "failed";
-        error = `Forge's checks still fail after ${MAX_FIX_ROUNDS} fix attempts, so this version was not saved.`;
+        error = `Forge's checks still fail after ${maxRounds} fix attempts, so this version was not saved.`;
         break;
       }
       turnPrompt = (opts.fixPreface ? `${opts.fixPreface}\n\n` : "") + fixPrompt(result.checks);
@@ -414,7 +556,7 @@ async function agentTurn(
   projectId: string,
   runId: string,
   prompt: string,
-  qa?: { systemPrompt: string; onIssue: (issue: QaIssue) => void; onTest?: (test: unknown) => void },
+  qa?: { systemPrompt: string; onIssue: (issue: QaIssue) => void; onTest?: (test: unknown) => void; maxTurns?: number },
   opts: { readOnly?: boolean; autonomous?: boolean } = {},
 ): Promise<{ status: TurnStatus; error?: string; result?: string }> {
   // The AI chosen in Settings › Integrations › AI model, read at the start of every turn.
@@ -430,9 +572,15 @@ async function agentTurn(
   let stderrTail = "";
 
   const [proj] = await db
-    .select({ sessionId: schema.project.agentSessionId })
+    .select({ sessionId: schema.project.agentSessionId, contextSent: schema.project.agentContextSent })
     .from(schema.project)
     .where(eq(schema.project.id, projectId));
+
+  // One request may spend at most FORGE_RUN_BUDGET_USD across its turns (0: no limit).
+  const budget = env.FORGE_RUN_BUDGET_USD;
+  const budgetLeft = budget > 0 ? budget - (runSpent.get(runId) ?? 0) : 0;
+  const overBudget = `This request reached its spending limit of $${budget.toFixed(2)}, so the agent stopped. What it changed so far is kept; send a message to continue.`;
+  if (budget > 0 && budgetLeft <= 0.01) return { status: "failed", error: overBudget };
 
   // total_cost_usd from a resumed session includes the session's earlier
   // spend, so subtract the last recorded session total to get this turn's cost.
@@ -467,34 +615,42 @@ async function agentTurn(
   const libraryNote = qa ? "" : await libraryReminder();
   const specText = qa ? "" : await specPrompt(projectId).catch(() => "");
   const redact = await redactor(projectId);
+  /*
+   * The system prompt holds only what never changes during a project (Forge's rules and, for
+   * imported repos, the repo's facts), so the provider's prompt cache survives. Everything that
+   * can change (brain, spec, library, secrets, data sources) travels in a <forge-context> block
+   * at the start of the message, and only the sections that changed since they were last sent
+   * in this conversation. Editing the brain then costs one section, not the whole history.
+   */
+  const context = qa
+    ? null
+    : contextBlock(proj?.sessionId ? (proj.contextSent ?? {}) : {}, [
+        ["Secrets", secretsText],
+        ["Data sources", dataText],
+        ["Component library", libraryText],
+        ["Living spec", specText],
+        ["Team brain and project notes", brainText],
+      ]);
+  // This turn's mode (not a property of the conversation, so not in the system prompt either).
+  const turnMode = [opts.readOnly ? CHAT_MODE_PROMPT : "", opts.autonomous ? AUTONOMOUS_PROMPT : ""].filter(Boolean).join("\n\n");
   const input = qa
-    ? { prompt, mode: "qa", model: ai.model, appendSystemPrompt: [qa.systemPrompt, brainText].filter(Boolean).join("\n\n") }
+    ? { prompt, mode: "qa", model: ai.model, maxBudgetUsd: budgetLeft, maxTurns: qa.maxTurns, appendSystemPrompt: [qa.systemPrompt, brainText].filter(Boolean).join("\n\n") }
     : {
-        prompt: opts.readOnly ? prompt : prompt + libraryNote + SPEC_REMINDER,
+        prompt: [context?.text, turnMode, opts.readOnly ? prompt : prompt + libraryNote + SPEC_REMINDER].filter(Boolean).join("\n\n"),
         readOnly: opts.readOnly || undefined,
         autonomous: opts.autonomous || undefined,
         sessionId: proj?.sessionId ?? undefined,
         model: ai.model,
-        appendSystemPrompt: [
-          APPEND_SYSTEM_PROMPT,
-          opts.readOnly ? CHAT_MODE_PROMPT : "",
-          opts.autonomous ? AUTONOMOUS_PROMPT : "",
-          importedText,
-          secretsText,
-          dataText,
-          libraryText,
-          specText,
-          brainText,
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
+        maxBudgetUsd: budgetLeft,
+        appendSystemPrompt: [APPEND_SYSTEM_PROMPT, importedText].filter(Boolean).join("\n\n"),
       };
+  if (context) await db.update(schema.project).set({ agentContextSent: context.sent }).where(eq(schema.project.id, projectId));
 
   // Events from one turn are appended in order; keep the chain so we can await it.
   let chain: Promise<unknown> = Promise.resolve();
   const queue = (fn: () => Promise<unknown>) => (chain = chain.then(fn).catch((e) => console.error("event append failed", e)));
 
-  const modelAccess = issueModelToken(projectId, runId, ai);
+  const modelAccess = issueModelToken(projectId, runId, { ...ai, ...(budget > 0 ? { budgetUsd: budget } : {}) });
   const exitCode = await execLines(
     projectId,
     ["node", "/opt/forge/runner/runner.mjs"],
@@ -520,7 +676,15 @@ async function agentTurn(
           // QA sessions are throwaway; only the build agent's session is resumed later.
           if (qa) break;
           queue(() =>
-            db.update(schema.project).set({ agentSessionId: line.sessionId }).where(eq(schema.project.id, projectId)),
+            db
+              .update(schema.project)
+              .set({
+                agentSessionId: line.sessionId,
+                // The agent could not resume and started a new conversation: it has not seen the
+                // context sections, so the next turn sends them all again.
+                ...(proj?.sessionId && proj.sessionId !== line.sessionId ? { agentContextSent: {} } : {}),
+              })
+              .where(eq(schema.project.id, projectId)),
           );
           break;
         case "qa_issue":
@@ -588,7 +752,18 @@ async function agentTurn(
             appendEvent({ type: "tool.result", projectId, runId, toolUseId: line.toolUseId, ok: line.ok, output: redact(line.output) }),
           );
           break;
-        case "usage":
+        case "usage": {
+          // ChatGPT runs: the real cost Forge's model proxy priced per request. The agent's own
+          // figure assumes Claude prices (it's still kept as sessionCostUsd for later Claude turns).
+          const cost = (() => {
+            if (ai.provider !== "openai") return { costUsd: Math.max(0, line.costUsd - priorSessionCost) };
+            const c = takeRunCost(runId);
+            return { costUsd: c?.usd ?? 0, pricedBy: "forge" as const, ...(c?.unpriced ? { costEstimated: true } : {}) };
+          })();
+          runSpent.set(runId, (runSpent.get(runId) ?? 0) + cost.costUsd);
+          // ChatGPT: the proxy knows the size (see model-proxy.ts runContextTokens).
+          const measured = ai.provider === "openai" ? runContextTokens(runId) : (line.contextTokens ?? 0);
+          const contextTokens = measured > 0 ? measured : undefined;
           queue(() =>
             appendEvent({
               type: "usage",
@@ -597,17 +772,22 @@ async function agentTurn(
               inputTokens: line.inputTokens,
               outputTokens: line.outputTokens,
               cacheReadTokens: line.cacheReadTokens,
-              // ChatGPT runs: the real cost Forge's model proxy priced per request. The agent's own
-              // figure assumes Claude prices (it's still kept as sessionCostUsd for later Claude turns).
-              ...(() => {
-                if (ai.provider !== "openai") return { costUsd: Math.max(0, line.costUsd - priorSessionCost) };
-                const c = takeRunCost(runId);
-                return { costUsd: c?.usd ?? 0, pricedBy: "forge" as const, ...(c?.unpriced ? { costEstimated: true } : {}) };
-              })(),
+              ...cost,
               ...(qa ? {} : { sessionCostUsd: line.costUsd }),
+              ...(contextTokens ? { contextTokens } : {}),
             }),
           );
+          // How big the build conversation is and when it was last used: freshSessionSeed() decides from these.
+          if (!qa) {
+            queue(() =>
+              db
+                .update(schema.project)
+                .set({ agentSessionAt: new Date(), ...(contextTokens ? { agentContextTokens: contextTokens } : {}) })
+                .where(eq(schema.project.id, projectId)),
+            );
+          }
           break;
+        }
         case "pause":
           if (!PAUSE_ID.test(line.pauseId)) break;
           {
@@ -632,6 +812,7 @@ async function agentTurn(
   await chain;
   if (exitCode !== 0 && status === "completed") status = "failed";
   if (status === "failed" && !error) error = stderrTail.trim() || `Runner exited with code ${exitCode}`;
+  if (status === "failed" && error && (error.includes("error_max_budget_usd") || error.includes(BUDGET_ERROR))) error = overBudget;
   return { status, error, result };
 }
 
@@ -640,12 +821,74 @@ async function agentTurn(
 const QA_SYSTEM_PROMPT = `You are the QA tester in Forge, our team's internal app builder.
 You test the running app like a careful teammate would, using the browser tools (mcp__browser__*). You cannot change code.
 - Start with mcp__browser__open on "/". Use the accessibility tree to find elements; use screenshots to judge layout and visuals.
+- Be quick. When you know the next few actions (fill a form and submit, click through tabs, add several items), do them in one mcp__browser__steps call instead of one call each; it returns what changed at the end. Use single click/fill/press only when you need to see the result before deciding the next action. Don't reopen a page you are already on, and don't take a screenshot unless looks matter for what you're checking.
+- There is one browser with one page. Never ask for several browser actions at the same time: do one, read the result, then the next (or put a known sequence into one mcp__browser__steps call). To test two pages, finish the first before opening the second.
+- If an element isn't found, read the names the error lists and use one of them exactly; don't guess again.
+- To check responsiveness, call mcp__browser__screen with phone, then tablet, take a screenshot at each and check that nothing overflows, overlaps or is cut off, then set it back to desktop.
+- Follow the scope you are given exactly: when told what to test, test only that; when told what not to test, leave it alone even if you notice it.
 - Verify each requested feature end to end, then try realistic edge cases: empty and invalid input, double clicks, reloading, keyboard use, and navigating back and forth.
 - Watch the console errors each tool reports.
 - Report every real problem with mcp__browser__report_issue (one call per issue, with exact steps). Severity: blocker = a requested feature doesn't work; major = wrong behaviour or confusing UX; minor = cosmetic. Don't report pure style preferences.
 - You may read the code (Read, Grep, Glob) to understand intent, but judge the app by what a user sees.
 - For each important flow that works, call mcp__browser__propose_test with the exact steps you used and expect steps that check the result (for example: vote twice, then expect the card to contain "Leading"). Forge replays them after every new version, so use stable targets (role + name, labels) and check outcomes, not exact styling. Propose at most 5, and none for flows that are broken.
 - Finish with a short plain-language summary for a non-technical teammate: what you tested, what works, and the most important problems.`;
+
+/**
+ * Smaller models write proposed tests a little loosely. Fill in what is unambiguous instead of
+ * dropping the test: an expect step without a state means "is shown" (or "contains" when it has a
+ * value), and "text" is not a role, so a target like { role: "text", text: "…" } is found by its text.
+ */
+function tidyProposal(p: unknown): unknown {
+  if (!p || typeof p !== "object" || !Array.isArray((p as { steps?: unknown }).steps)) return p;
+  const steps = (p as { steps: Record<string, unknown>[] }).steps.map((step) => {
+    if (!step || typeof step !== "object") return step;
+    const out = { ...step };
+    const target = out.target && typeof out.target === "object" ? { ...(out.target as Record<string, unknown>) } : undefined;
+    if (target) {
+      if (target.role === "text" || target.role === "generic") {
+        if (!target.text && typeof target.name === "string") target.text = target.name;
+        delete target.role;
+        delete target.name;
+      }
+      out.target = target;
+    }
+    if (out.action === "expect" && !out.state) out.state = out.value ? "contains" : "visible";
+    return out;
+  });
+  return { ...(p as object), steps };
+}
+
+export type QaScope = { only?: string; skip?: string; depth?: "quick" | "full" };
+
+/** What the test agent is asked to do, from the scope the person gave. */
+function qaPrompt(o: { scope: QaScope; quick: boolean; focus?: string; requests: string[]; specText: string }): string {
+  const { scope, quick } = o;
+  const latest = o.requests[o.requests.length - 1];
+  const what = scope.only
+    ? `Test this, and only this, as the team asked:\n${scope.only}`
+    : o.focus
+      ? `A new version was just saved for this request. Test that it works:\n${o.focus.slice(0, 2000)}`
+      : quick
+        ? latest
+          ? `Check that the app's main flow works, and that the most recent request works:\n${latest}`
+          : "Check that the app's main flow works."
+        : o.requests.length
+          ? `It was built from these requests (oldest first); check that each works:\n${o.requests.join("\n")}`
+          : "Explore its main features.";
+  return [
+    "Test this app in the browser.",
+    what,
+    scope.skip ? `Do NOT test or report on any of this, even if you come across it:\n${scope.skip}` : "",
+    quick
+      ? "This is a quick test: aim to finish in about a minute. Go straight to what you were asked to check, try at most one or two obvious edge cases, don't read the code, and propose at most 2 tests. Stop as soon as you know whether it works."
+      : "This is a full test: cover every feature, then realistic edge cases (empty and invalid input, double clicks, reloading, keyboard use, going back and forth).",
+    !quick && !scope.only && o.focus ? "Then briefly re-check the main features." : "",
+    o.specText,
+    "Report each problem with report_issue, then finish with a short summary that starts by saying what you tested and what you left out.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
 
 /**
  * Start a QA run. `focus`: the request a new version was saved for (auto-test).
@@ -658,6 +901,8 @@ export async function startQa(
   testRequest?: string,
   /** Write tests for these spec criteria (ids); passing ones are saved and linked automatically. */
   cover?: string[],
+  /** What the person asked to test or skip, and how thorough to be (default: quick). */
+  scope: QaScope = {},
 ) {
   if (active.has(projectId)) throw new RunConflictError("A run is already in progress for this project.");
   const runId = nanoid(10);
@@ -668,18 +913,30 @@ export async function startQa(
     await exec(projectId, ["sh", "-c", 'pkill -TERM -f "[/]opt/forge/runner/runner.mjs"; true']).catch(() => undefined);
   };
   try {
+    // Testing runs on a middle model when the default is the dearest tier (ai.ts qaModelKey).
+    const qaKey = await qaModelKey().catch(() => null);
+    runModel.set(runId, qaKey);
     await appendEvent({
       type: "run.started",
       projectId,
       runId,
       prompt: cover
         ? `Write tests for ${cover.length === 1 ? "a spec criterion" : `${cover.length} spec criteria`}`
+        : scope.only || scope.skip
+          ? [
+              scope.only ? `Test: ${scope.only.slice(0, 300)}` : scope.depth === "full" ? "Full test of the app" : "Quick test",
+              scope.skip ? `Skip: ${scope.skip.slice(0, 200)}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n")
+          : scope.depth === "full"
+            ? "Full test of the app in a browser"
         : testRequest
         ? `Create a test: ${testRequest.slice(0, 300)}`
         : focus
           ? `Automatic test after: ${focus.split("\n")[0]!.slice(0, 200)}`
           : "Test the app in a browser and report problems",
-      ...(await aiForRun().then(
+      ...(await aiForRun(runModel.get(runId)).then(
         (ai) => ({ model: ai.model, modelLabel: ai.label, provider: ai.provider }),
         () => ({ model: "" }),
       )),
@@ -689,17 +946,29 @@ export async function startQa(
     });
   } catch (err) {
     active.delete(projectId);
+    runModel.delete(runId);
     throw err;
   }
-  void executeQa(projectId, runId, entry, focus, testRequest, cover, user.name).finally(() => {
+  void executeQa(projectId, runId, entry, focus, testRequest, cover, user.name, scope).finally(() => {
     active.delete(projectId);
+    runModel.delete(runId);
+    runSpent.delete(runId);
     forgetRunCost(runId);
     if (!entry.cancelled) void runNext(projectId).catch((e) => console.error("queued message did not start", e));
   });
   return runId;
 }
 
-async function executeQa(projectId: string, runId: string, entry: Active, focus?: string, testRequest?: string, cover?: string[], userName = "Forge") {
+async function executeQa(
+  projectId: string,
+  runId: string,
+  entry: Active,
+  focus?: string,
+  testRequest?: string,
+  cover?: string[],
+  userName = "Forge",
+  scope: QaScope = {},
+) {
   const issues: QaIssue[] = [];
   const proposals: unknown[] = [];
   let status: TurnStatus = "failed";
@@ -724,7 +993,9 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
       .map((p, i) => `${i + 1}. ${p.prompt.slice(0, 1500)}`);
     const spec = await getSpec(projectId).catch(() => null);
     const toCover = cover ? (spec?.criteria ?? []).filter((c) => cover.includes(c.id)) : [];
-    const specText = cover || testRequest ? "" : await specQaPrompt(projectId).catch(() => "");
+    const quick = (scope.depth ?? "quick") === "quick";
+    // A quick or narrowed test doesn't walk the whole spec.
+    const specText = cover || testRequest || quick || scope.only ? "" : await specQaPrompt(projectId).catch(() => "");
     const prompt = cover
       ? toCover.length
         ? coverPrompt(toCover)
@@ -734,20 +1005,14 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
           `Create a repeatable test for this, as the team described it:\n${testRequest.slice(0, 2000)}`,
           "Walk through it in the browser first. If it works, call propose_test once with the steps and expect checks. If it doesn't work, report it with report_issue instead. Don't test anything else.",
         ].join("\n\n")
-      : [
-      "Test this app in the browser.",
-      ...(focus
-        ? [`A new version was just saved for this request. Test it first and thoroughly, then briefly re-check the main features:\n${focus.slice(0, 2000)}`]
-        : []),
-      requests.length ? `It was built from these requests (oldest first); check that each works:\n${requests.join("\n")}` : "Explore its main features.",
-      ...(specText ? [specText] : []),
-      "Report each problem with report_issue, then summarize.",
-    ].join("\n\n");
+      : qaPrompt({ scope, quick, focus, requests, specText });
 
     const turn = await agentTurn(projectId, runId, prompt, {
       systemPrompt: QA_SYSTEM_PROMPT,
       onIssue: (i) => issues.push(i),
-      onTest: (t) => proposals.length < (cover ? 20 : 8) && proposals.push(t),
+      onTest: (t) => proposals.length < (cover ? 20 : quick ? 3 : 8) && proposals.push(t),
+      // Model calls, not browser actions (one call can do up to 10 actions).
+      maxTurns: cover ? 80 : testRequest ? 30 : quick ? 25 : 70,
     });
     status = entry.cancelled ? "cancelled" : turn.status;
     error = turn.error;
@@ -755,7 +1020,7 @@ async function executeQa(projectId: string, runId: string, entry: Active, focus?
       // Replay each proposed test once, so the team only gets offered ones that pass.
       const known = new Set((spec?.criteria ?? []).map((c) => c.id));
       const valid = proposals.flatMap((p) => {
-        const r = SaveTestInput.safeParse(p);
+        const r = SaveTestInput.safeParse(tidyProposal(p));
         if (!r.success) return [];
         // Only ids of criteria that exist; the agent may misremember one.
         const { criterionId, ...test } = r.data;
@@ -1016,7 +1281,8 @@ async function maybeAutoQa(projectId: string, latestPrompt: string) {
     });
     return;
   }
-  await startQa(projectId, { id: "forge", name: "Forge (auto-test)" }, latestPrompt);
+  // Automatic tests are quick ones: just the request that was saved.
+  await startQa(projectId, { id: "forge", name: "Forge (auto-test)" }, latestPrompt, undefined, undefined, { depth: "quick" });
 }
 
 /** Cents spent today (UTC) on QA runs in a project. */

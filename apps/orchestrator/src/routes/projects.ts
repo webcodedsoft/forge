@@ -11,6 +11,7 @@ import {
   type SandboxStatus,
   type StartRunResponse,
   CreatePreviewShareInput,
+  StartQaInput,
 } from "@forge/protocol";
 import { ConnectionError, projectConnectionIds, setProjectConnections } from "../connections.ts";
 import { desc, eq } from "drizzle-orm";
@@ -269,7 +270,10 @@ export const projects = new Hono<AppEnv>()
     if (!(await projectExists(id))) return c.json({ error: "not_found" }, 404);
     try {
       const user = c.get("user");
-      return c.json({ runId: await startQa(id, { id: user.id, name: user.name }) }, 202);
+      const scope = StartQaInput.safeParse(await c.req.json().catch(() => ({})));
+      if (!scope.success) return c.json({ error: "Keep each box under 2,000 characters." }, 400);
+      const { only, skip, depth } = scope.data;
+      return c.json({ runId: await startQa(id, { id: user.id, name: user.name }, undefined, undefined, undefined, { only: only || undefined, skip: skip || undefined, depth }) }, 202);
     } catch (err) {
       if (err instanceof RunConflictError) return c.json({ error: err.message }, 409);
       throw err;

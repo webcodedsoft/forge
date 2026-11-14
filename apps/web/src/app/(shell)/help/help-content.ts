@@ -83,6 +83,7 @@ export const CATEGORIES: Category[] = [
         body: [
           "The model picker sits next to the mode in the prompt box. It lists the models your admin allows, with a hint and a cost level (Low, Medium or High cost).",
           "The project remembers your choice. Each answer's cost line shows which model answered.",
+          "Auto lets Forge choose per request: a cheaper model for small edits, the default for features, plans and fixes. If the cheaper model can't get the checks to pass, the default takes over.",
           "If one model keeps getting stuck on a problem, trying another often helps.",
         ],
       },
@@ -180,7 +181,7 @@ export const CATEGORIES: Category[] = [
         summary: "See errors from the running app, saved tests and a security scan.",
         body: [
           "Problems lists errors seen in the browser and on the server. Fix this (or Fix all) hands them to the agent.",
-          "Saved tests replay after every version. Test the app sends a QA agent through the app in a real browser; Auto-test does this after each version within a daily budget.",
+          "Saved tests replay after every version. Test the app sends a test agent through the app in a real browser. Before it starts you can say what to test and what to leave alone, and pick Quick (about a minute, just what you named or the latest change) or Full (every feature and edge cases). Auto-test runs a quick test after each version within a daily budget.",
           "Security scans every version for leaked keys and risky code.",
           "Accessibility lists what an automatic scan of every page found (contrast, missing labels, keyboard problems). It never blocks saving; Fix hands a problem to the agent.",
         ],

@@ -160,8 +160,12 @@ async function guestThreads(projectId: string, shareId: string): Promise<Project
     .where(and(eq(schema.projectComment.projectId, projectId), eq(schema.projectComment.shareId, shareId)));
   const mine = new Set(rows.map((r) => r.id));
   for (const c of all) if (!c.parentId && mine.has(c.id)) roots.add(c.id);
+  // The same numbers the team sees (threads in creation order), so "comment 3" means the same on both sides.
+  const number = new Map(all.filter((c) => !c.parentId).map((c, i) => [c.id, i + 1]));
   // Team members' ids stay private; visitors only need names.
-  return all.filter((c) => roots.has(c.id) || (c.parentId && roots.has(c.parentId))).map((c) => ({ ...c, userId: "", via: undefined }));
+  return all
+    .filter((c) => roots.has(c.id) || (c.parentId && roots.has(c.parentId)))
+    .map((c) => ({ ...c, userId: "", via: undefined, ...(c.parentId ? {} : { n: number.get(c.id) }) }));
 }
 
 export const publicFeedback = new Hono()

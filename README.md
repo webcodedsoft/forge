@@ -242,6 +242,41 @@ These avoid 3000 and 8787, which other projects on this Mac already use.
   public pull request all pass. Not yet run with a model, because the workspace's only AI key had no credits: the agent
   calling `update_spec`, QA writing tests per criterion, the agent resolving merge conflicts (detection, cancel and
   discard were tested), and addressing review feedback.
+- AI cost controls (2026-11-14; measured before: one never-ending conversation per project, 52k-87k tokens resent at
+  every step, and whole histories billed again after a pause).
+  - Fresh conversations (`runs.ts` `freshSessionSeed`): a project's agent conversation starts over, with a summary of the
+    last six requests and their outcomes, when it holds more than `FORGE_SESSION_MAX_TOKENS` (90k), or has been idle for
+    `FORGE_SESSION_IDLE_MIN` (5) minutes and holds more than `FORGE_SESSION_IDLE_TOKENS` (40k). Size and last use are kept
+    on `project.agent_context_tokens` / `agent_session_at` (Claude: reported by the runner; ChatGPT: by the model proxy).
+  - Context outside the system prompt (`contextBlock`): the system prompt is now only Forge's rules (plus an imported repo's
+    facts) and the runner sets `excludeDynamicSections`, so it is identical for every project and conversation. Brain, spec,
+    library, secrets and data sources travel in a `<forge-context>` block at the start of a message, and only sections
+    whose hash changed since they were sent in this conversation (`project.agent_context_sent`).
+  - ChatGPT (`openai-bridge.ts`): `prompt_cache_key` per project; reasoning items are kept in memory and put back before
+    the tool call they led to (`include: reasoning.encrypted_content`), so the model doesn't re-think every step; side tasks
+    use low effort and, with no fast model set, the cheapest allowed OpenAI model; `FORGE_OPENAI_EFFORT` sets the building
+    effort (default medium). A 400 that names one of these optional fields is retried once without them. GPT-5.5 has a
+    list price, so its runs are no longer recorded as $0.
+  - Auto (`ai.ts` `pickAuto`, model picker): per request, without AI: small edits start on the cheapest allowed model,
+    plans, designs, long requests, attachments and anything that reads like a feature or a fix use the default. When the
+    cheap model's own fix attempt also fails the checks, the default takes over and gets one extra round.
+  - Testing: click/fill/press return only the lines of the page that changed (the whole page on open and snapshot),
+    screenshots are JPEG, and QA runs on the cheapest allowed model that is cheaper than the default (`qaModelKey`;
+    `FORGE_QA_MODEL` picks another, or `default`). Its cursor is a magenta arrow with a halo so it stands out.
+  - Spending cap: `FORGE_RUN_BUDGET_USD` (default 5, 0 = off) per request. Claude: the agent SDK's `maxBudgetUsd`;
+    ChatGPT: the model proxy refuses further calls. The run ends with a clear message and the changes stay unsaved.
+  - Test scope and speed (`test-button.tsx`, `StartQaInput`, `runs.ts` `qaPrompt`): "Test the app" opens a small form: what
+    to test, what to leave alone, Quick or Full. Quick (the default, also used by Auto-test) checks only what was named or
+    the latest request, skips the spec walk, and is capped at 25 model calls; Full at 70. The test agent has a `steps` tool
+    (up to 10 actions per model call), waits for the page to stop changing (`settle`, 150 ms quiet, max 0.8 s) instead of
+    fixed pauses, and a test that hits its call limit still reports what it found.
+    Browser tools run one at a time (`inTurn`; ChatGPT test runs also get `parallel_tool_calls: false`), because actions
+    asked for together raced on the single page. `find` fails within about 1.5 s with the names that are on the page,
+    tries the same name as label, placeholder, other roles, title and text first, and reports disabled controls at once.
+    Text is typed out visibly. `screen` switches to phone/tablet/desktop size and says whether the page overflows.
+  Tested end to end against a mock OpenAI server (system prompt identical between requests, context sent once, fresh
+  conversation 37.7k -> 18.5k tokens, reasoning returned on the next step, cap stops the run). Not yet run against real
+  OpenAI or Claude: no key had credits.
 - Next: phase 4b, Entra SSO (Forge sign-in, and the preview proxy injecting the teammate's API token as
   `x-forge-access-token`, which the generated proxy forwards as `Authorization: Bearer`). Waiting on
   tenant ID, the API scope and a Forge app registration.

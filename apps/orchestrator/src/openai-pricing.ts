@@ -15,6 +15,8 @@ const LIST: [RegExp, ModelPrice][] = [
   [/^gpt-5-nano/, { input: 0.05, cachedInput: 0.005, output: 0.4 }],
   [/^gpt-5-mini/, { input: 0.25, cachedInput: 0.025, output: 2 }],
   [/^gpt-5(-\d{4}-\d{2}-\d{2})?$/, { input: 1.25, cachedInput: 0.125, output: 10 }],
+  // From OpenAI's model page, November 2026.
+  [/^gpt-5\.5(-\d{4}-\d{2}-\d{2})?$/, { input: 5, cachedInput: 0.5, output: 30 }],
   [/^o4-mini/, { input: 1.1, cachedInput: 0.275, output: 4.4 }],
   [/^o3-mini/, { input: 1.1, cachedInput: 0.55, output: 4.4 }],
   [/^o3(-\d{4}-\d{2}-\d{2})?$/, { input: 2, cachedInput: 0.5, output: 8 }],

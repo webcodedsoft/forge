@@ -440,10 +440,11 @@ export function ModelPicker({ data, value, onChange, mode }: { data: ProjectMode
     };
   }, [open]);
   if (data.models.length < 2) return null;
+  const isAuto = value === "auto" && Boolean(data.auto);
   const current = data.models.find((m) => m.key === value) ?? data.models.find((m) => m.key === data.defaultKey) ?? data.models[0]!;
   // "Claude Opus 5.5" → "Opus 5.5" on the button (the menu shows full names).
   // and "gpt-4.1-2025-04-14" → "gpt-4.1" (the date is noise on a small button).
-  const short = current.label.replace(/^(Claude|ChatGPT)\s+/i, "").replace(/-\d{4}-\d{2}-\d{2}$/, "");
+  const short = isAuto ? "Auto" : current.label.replace(/^(Claude|ChatGPT)\s+/i, "").replace(/-\d{4}-\d{2}-\d{2}$/, "");
   const groups = (["anthropic", "openai"] as const)
     .map((p) => ({ p, title: p === "anthropic" ? "Claude" : "ChatGPT", items: data.models.filter((m) => m.provider === p) }))
     .filter((g) => g.items.length);
@@ -453,8 +454,8 @@ export function ModelPicker({ data, value, onChange, mode }: { data: ProjectMode
         type="button"
         className="btn btn-sm max-w-40"
         aria-expanded={open}
-        aria-label={`Model: ${current.label}. Change model`}
-        title={`${current.label}: ${current.hint}`}
+        aria-label={`Model: ${isAuto ? "Auto" : current.label}. Change model`}
+        title={isAuto ? "Auto: Forge picks the model for each request" : `${current.label}: ${current.hint}`}
         onClick={() => setOpen((o) => !o)}
       >
         <Sparkles size={13} className="@max-[28rem]:hidden" aria-hidden />
@@ -465,11 +466,36 @@ export function ModelPicker({ data, value, onChange, mode }: { data: ProjectMode
         <div className="menu-pop pop absolute bottom-10 left-0 z-40 w-[min(20rem,calc(100vw-2rem))] overflow-hidden" role="listbox" aria-label="Model">
           <p className="border-b border-line px-3.5 py-2.5 text-[12px] text-ink-3">Model for your next message. The project remembers it.</p>
           <div className="max-h-80 overflow-y-auto p-1.5">
+            {data.auto && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={isAuto}
+                onClick={() => {
+                  onChange("auto");
+                  setOpen(false);
+                }}
+                className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${isAuto ? "bg-primary-weak" : "hover:bg-surface-2"}`}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className={`flex items-center gap-1.5 text-[13.5px] font-medium ${isAuto ? "text-primary" : "text-ink"}`}>
+                    <Sparkles size={13} aria-hidden />
+                    Auto
+                    <span className="pill text-[10px]">Saves cost</span>
+                  </span>
+                  <span className="block text-[12px] text-ink-3">
+                    Forge picks per request: a cheaper model for small edits, the default for features, plans and fixes. It moves up if checks keep
+                    failing.
+                  </span>
+                </span>
+                {isAuto && <Check size={15} className="mt-0.5 shrink-0 text-primary" aria-hidden />}
+              </button>
+            )}
             {groups.map((g) => (
               <div key={g.p}>
                 {groups.length > 1 && <p className="lab px-2.5 pb-1 pt-2">{g.title}</p>}
                 {g.items.map((m) => {
-                  const on = m.key === current.key;
+                  const on = !isAuto && m.key === current.key;
                   // Chat-only models can't build: only usable in Chat mode.
                   const blocked = !m.canCode && mode !== "chat";
                   return (

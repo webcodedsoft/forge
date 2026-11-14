@@ -230,7 +230,8 @@ export const api = {
     }),
   updateSettings: (id: string, input: ProjectSettingsInput) =>
     request<Project>(`/projects/${encodeURIComponent(id)}/settings`, { method: "PATCH", body: JSON.stringify(input) }),
-  startQa: (id: string) => request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/qa`, { method: "POST" }),
+  startQa: (id: string, scope: { only?: string; skip?: string; depth?: "quick" | "full" } = {}) =>
+    request<{ runId: string }>(`/projects/${encodeURIComponent(id)}/qa`, { method: "POST", body: JSON.stringify(scope) }),
   cancelRun: (id: string) =>
     request<{ cancelled: boolean }>(`/projects/${encodeURIComponent(id)}/runs/cancel`, { method: "POST" }),
   answerPause: (id: string, pauseId: string, answer: AnswerPauseInput) =>

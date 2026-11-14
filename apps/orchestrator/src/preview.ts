@@ -97,13 +97,27 @@ async function handleEntry(req: IncomingMessage, res: ServerResponse, proj: { id
   const url = new URL(req.url ?? "/", "http://x");
   if (url.pathname === "/__forge/enter") {
     const t = verifyEnterToken(url.searchParams.get("t") ?? undefined);
+    const wanted = url.searchParams.get("next") ?? "/";
+    const next = wanted.startsWith("/") && !wanted.startsWith("//") ? wanted : "/";
     if (!t || t.p !== proj.id || t.c !== proj.compare) {
-      res.writeHead(403, { "content-type": "text/html; charset=utf-8" });
-      res.end(notice("This link has expired", "Open the project in Forge again to see its preview."));
+      // An entry link lasts 5 minutes, and the builder's preview frame can come back with an old
+      // one (after the test agent's live view, or a tab left open). A browser that still has its
+      // pass just goes on; inside the builder's frame, ask the builder for a fresh link.
+      if (await hasPass(req, proj.id).catch(() => false)) {
+        redirect(res, next);
+        return true;
+      }
+      const inFrame = req.headers["sec-fetch-dest"] === "iframe";
+      const ask = inFrame ? `<script>try{parent.postMessage({type:"forge:preview-access"},${JSON.stringify(FORGE_ORIGIN)})}catch(e){}</script>` : "";
+      res.writeHead(403, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      res.end(
+        inFrame
+          ? page("Getting your app ready…", "It will appear here in a moment.").replace("</body>", `${ask}</body>`)
+          : notice("This link has expired", "Open the project in Forge again to see its preview."),
+      );
       return true;
     }
-    const next = url.searchParams.get("next") ?? "/";
-    redirect(res, next.startsWith("/") && !next.startsWith("//") ? next : "/", passCookie(memberPass(proj.id), req));
+    redirect(res, next, passCookie(memberPass(proj.id), req));
     return true;
   }
   const share = /^\/__forge\/share\/([A-Za-z0-9_-]{20,64})$/.exec(url.pathname);

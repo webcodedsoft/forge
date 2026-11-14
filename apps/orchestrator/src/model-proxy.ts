@@ -27,6 +27,8 @@ export type RunAi = {
   apiKey: string;
   /** Admin-set prices of OpenAI models (by id); others use Forge's list price. */
   prices?: Record<string, ModelPrice>;
+  /** ChatGPT runs: stop answering once the run has spent this much (USD). Claude runs are capped by the agent itself. */
+  budgetUsd?: number;
 };
 
 /**
@@ -34,6 +36,8 @@ export type RunAi = {
  * takes it when the agent reports usage (takeRunCost), replacing the agent's Claude-priced guess.
  */
 const runCost = new Map<string, { usd: number; unpriced: boolean }>();
+/** Everything a ChatGPT run has spent, for its spending limit. */
+const runTotal = new Map<string, number>();
 
 /** The cost added since the last call, and whether any of it had no known price. */
 export function takeRunCost(runId: string): { usd: number; unpriced: boolean } | null {
@@ -42,7 +46,19 @@ export function takeRunCost(runId: string): { usd: number; unpriced: boolean } |
   runCost.set(runId, { usd: 0, unpriced: false });
   return c;
 }
-export const forgetRunCost = (runId: string) => void runCost.delete(runId);
+/**
+ * ChatGPT runs: how many tokens the conversation held at the latest building step (what it read
+ * plus what it wrote). The agent can't report this itself: OpenAI's usage arrives at the end of
+ * a streamed answer, after the agent has noted the message.
+ */
+const runContext = new Map<string, number>();
+export const runContextTokens = (runId: string) => runContext.get(runId) ?? 0;
+export const forgetRunCost = (runId: string) => {
+  runCost.delete(runId);
+  runTotal.delete(runId);
+  runContext.delete(runId);
+};
+export const BUDGET_ERROR = "reached its spending limit";
 const tokens = new Map<string, { projectId: string; runId: string; expires: number; ai: RunAi }>();
 
 /** A token for one run, using the AI chosen when the run started. Call revoke() when the run ends. */
@@ -96,7 +112,7 @@ function readJson(req: IncomingMessage): Promise<unknown> {
 }
 
 /** ChatGPT runs: answer the Messages API with OpenAI. */
-async function viaOpenAI(req: IncomingMessage, res: ServerResponse, ai: RunAi, runId: string) {
+async function viaOpenAI(req: IncomingMessage, res: ServerResponse, ai: RunAi, runId: string, projectId: string) {
   const path = req.url!.split("?")[0]!;
   if (req.method !== "POST" || !path.startsWith("/v1/messages")) return anthropicError(res, 404, `Not available with ChatGPT: ${path}`);
   let body: AnthropicRequest;
@@ -110,13 +126,20 @@ async function viaOpenAI(req: IncomingMessage, res: ServerResponse, ai: RunAi, r
     return res.end(JSON.stringify({ input_tokens: estimateTokens(body) }));
   }
   if (path !== "/v1/messages") return anthropicError(res, 404, `Not available with ChatGPT: ${path}`);
+  if (ai.budgetUsd && (runTotal.get(runId) ?? 0) >= ai.budgetUsd) {
+    return anthropicError(res, 400, `This request ${BUDGET_ERROR} ($${ai.budgetUsd.toFixed(2)}).`);
+  }
   // The agent asks for Claude ids for small side tasks; those use the fast model.
-  const model = !body.model || body.model.startsWith("claude") ? (ai.fastModel ?? ai.model) : body.model;
-  const used = await bridgeMessages(body, res, ai.apiKey, model);
+  const sideTask = !body.model || body.model.startsWith("claude");
+  const model = sideTask ? (ai.fastModel ?? ai.model) : body.model;
+  const used = await bridgeMessages(body, res, ai.apiKey, model, { cacheKey: `forge-${projectId}`, sideTask });
   if (used) {
     const price = ai.prices?.[model] ?? listPrice(model);
+    const usd = price ? priceTokens(price, used) : 0;
     const c = runCost.get(runId) ?? { usd: 0, unpriced: false };
-    runCost.set(runId, price ? { usd: c.usd + priceTokens(price, used), unpriced: c.unpriced } : { usd: c.usd, unpriced: true });
+    runCost.set(runId, price ? { usd: c.usd + usd, unpriced: c.unpriced } : { usd: c.usd, unpriced: true });
+    runTotal.set(runId, (runTotal.get(runId) ?? 0) + usd);
+    if (!sideTask) runContext.set(runId, used.input + used.cached + used.output);
   }
 }
 
@@ -130,7 +153,7 @@ export function startModelProxy() {
       return deny(res, 401, "This run's model access has ended.");
     }
     if (entry.ai.provider === "openai") {
-      viaOpenAI(req, res, entry.ai, entry.runId).catch((err) => anthropicError(res, 502, `Forge model proxy: ${err instanceof Error ? err.message : String(err)}`));
+      viaOpenAI(req, res, entry.ai, entry.runId, entry.projectId).catch((err) => anthropicError(res, 502, `Forge model proxy: ${err instanceof Error ? err.message : String(err)}`));
       return;
     }
     delete req.headers.authorization;

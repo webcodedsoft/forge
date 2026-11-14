@@ -1,7 +1,7 @@
 "use client";
 
 import type { RunEvent } from "@forge/protocol";
-import { Bug, Camera, Code2, Eye, FlaskConical, Globe, Keyboard, type LucideIcon, MousePointerClick, Sparkles, TextCursorInput } from "lucide-react";
+import { Bug, Camera, Code2, Eye, FlaskConical, Globe, Keyboard, type LucideIcon, MousePointerClick, Smartphone, Sparkles, TextCursorInput } from "lucide-react";
 import { useMemo } from "react";
 
 /*
@@ -33,6 +33,13 @@ export function qaStep(tool: string, input: unknown): Omit<Step, "id" | "done"> 
       return { icon: TextCursorInput, text: `Typing “${short(str(i.value), 40)}” into “${short(target(i), 40)}”` };
     case "mcp__browser__press":
       return { icon: Keyboard, text: `Pressing ${str(i.key) || "a key"}` };
+    case "mcp__browser__steps": {
+      const steps = Array.isArray(i.steps) ? (i.steps as Record<string, unknown>[]) : [];
+      const first = steps[0] ? qaStep(`mcp__browser__${str(steps[0].action)}`, { ...steps[0], ...((steps[0].target as object) ?? {}) }) : null;
+      return { icon: MousePointerClick, text: steps.length > 1 ? `${first?.text ?? "Working"}, then ${steps.length - 1} more action${steps.length === 2 ? "" : "s"}` : (first?.text ?? "Working") };
+    }
+    case "mcp__browser__screen":
+      return { icon: Smartphone, text: `Switching to ${str(i.size) || "another"} screen size` };
     case "mcp__browser__snapshot":
       return { icon: Eye, text: "Reading the page" };
     case "mcp__browser__screenshot":

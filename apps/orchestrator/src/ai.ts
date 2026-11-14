@@ -49,6 +49,9 @@ async function stored() {
 
 const envKey = (p: AiProvider) => (p === "anthropic" ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY) || undefined;
 
+/** The picker's "Auto": Forge chooses per request (pickAuto) and moves up when checks keep failing. */
+export const AUTO_MODEL = "auto";
+
 /** "provider:model", how a model is named in requests and on projects. */
 export const modelKey = (provider: AiProvider, id: string) => `${provider}:${id}`;
 
@@ -118,11 +121,92 @@ export async function aiForRun(choice?: string | null): Promise<RunAiChoice> {
   const apiKey = keyFor(provider);
   if (!apiKey) throw new IntegrationError(`${PROVIDER_NAME[provider]} has no API key. An admin can add one in Settings › Integrations › AI model.`);
   const label = allowed.find((m) => m.provider === provider && m.id === model)?.label ?? model;
-  // The fast model is set for the default provider. Claude without one uses its own default
-  // (Haiku); ChatGPT uses the chosen model.
-  const fastModel = provider === defProvider && s.config?.fastModel ? s.config.fastModel : provider === "openai" ? model : null;
+  // The fast model (the agent's small side tasks) is set for the default provider. Claude without
+  // one uses its own default (Haiku). ChatGPT without one uses the cheapest allowed OpenAI model
+  // that isn't dearer than the chosen one, so titles and command checks don't run on the big model.
+  const cheapestOpenAi = allowed
+    .filter((m) => m.provider === "openai" && modelCanCode("openai", m.id))
+    .sort((a, b) => a.cost - b.cost)[0];
+  const ownCost = allowed.find((m) => m.provider === provider && m.id === model)?.cost ?? guessCost(model);
+  const fastModel =
+    provider === defProvider && s.config?.fastModel
+      ? s.config.fastModel
+      : provider === "openai"
+        ? cheapestOpenAi && cheapestOpenAi.cost < ownCost
+          ? cheapestOpenAi.id
+          : model
+        : null;
   const prices = Object.fromEntries(allowed.flatMap((m) => (m.provider === "openai" && m.price ? [[m.id, m.price] as const] : [])));
   return { provider, model, label, fastModel, apiKey, prices };
+}
+
+/* --------------------------------- Auto --------------------------------- */
+
+/** Models with a key that can build, cheapest first; the default's provider first among equals. */
+async function buildModels() {
+  const s = await stored();
+  const defProvider = s.config?.provider ?? "anthropic";
+  const defModel = s.config?.model ?? env.FORGE_MODEL;
+  const usable = allowedOf(s.config).filter((m) => (s.secret[m.provider] ?? envKey(m.provider)) && modelCanCode(m.provider, m.id));
+  const sorted = [...usable].sort((a, b) => a.cost - b.cost || Number(b.provider === defProvider) - Number(a.provider === defProvider));
+  const def = usable.find((m) => m.provider === defProvider && m.id === defModel) ?? sorted[sorted.length - 1];
+  return { sorted, def };
+}
+
+/** Requests that are small, self-contained edits. */
+const SMALL =
+  /\b(typo|spelling|rename|reword|wording|text|label|title|heading|caption|copy|colou?r|font|bold|italic|size|bigger|smaller|padding|margin|spacing|gap|align|center|centre|icon|emoji|logo|border|radius|rounded|shadow|hide|remove the|delete the|swap|capitali[sz]e|placeholder|tooltip|link)\b/i;
+/** Requests that need the strong model whatever their length. */
+const BIG =
+  /\b(new page|add a page|pages|dashboard|auth|login|sign[- ]?in|sign[- ]?up|database|schema|migration|api|endpoint|integrat|refactor|architecture|redesign|rebuild|from scratch|workflow|permissions?|roles?|payment|upload|search|filter|chart|table|form|wizard|import|export|sync|real[- ]?time|notification|tests?|bugs?|errors?|broken|crash\w*|fix\w*|doesn'?t work|not working|fail\w*|conflicts?)\b/i;
+
+export type AutoPick = { key: string; label: string; tier: "small" | "standard" | "large"; why: string };
+
+/**
+ * Auto: which model a request starts on. No AI involved: the mode, the request's length, whether
+ * it has attachments and a few keywords decide. Small edits start on the cheapest model; plans,
+ * designs and anything that reads like a feature or a bug use the workspace default.
+ */
+export async function pickAuto(prompt: string, mode: string): Promise<AutoPick | null> {
+  const { sorted, def } = await buildModels();
+  if (!def) return null;
+  const pick = (m: (typeof sorted)[number], tier: AutoPick["tier"], why: string): AutoPick => ({ key: modelKey(m.provider, m.id), label: m.label, tier, why });
+  const cheapest = sorted[0]!;
+  const text = prompt.replace(/\(Forge:[\s\S]*?\)/g, "").trim();
+  const attached = /\.forge\/uploads\//.test(text) || /figma\.com\//i.test(text);
+  if (mode === "plan" || mode === "design") return pick(def, "large", mode === "plan" ? "a plan" : "a design to rebuild");
+  if (mode === "chat") return pick(cheapest, "small", "a question");
+  if (cheapest.cost >= def.cost) return pick(def, "standard", "the only model allowed");
+  if (attached || text.length > 600 || BIG.test(text)) return pick(def, "large", attached ? "it has attachments" : text.length > 600 ? "a long request" : "it reads like a feature or a fix");
+  if (text.length <= 240 && SMALL.test(text)) return pick(cheapest, "small", "a small edit");
+  // In between: the middle model when there is one, else the default.
+  const mid = sorted.find((m) => m.cost > cheapest.cost && m.cost < def.cost);
+  return mid ? pick(mid, "standard", "an everyday change") : pick(def, "standard", "an everyday change");
+}
+
+/** The next model up from `key` (for Auto when checks keep failing), or null when it's already the default or dearer. */
+export async function strongerThan(key: string | null): Promise<{ key: string; label: string } | null> {
+  const { sorted, def } = await buildModels();
+  if (!def) return null;
+  const cur = sorted.find((m) => modelKey(m.provider, m.id) === key);
+  if (!cur || cur.cost >= def.cost) return null;
+  return { key: modelKey(def.provider, def.id), label: def.label };
+}
+
+/**
+ * The model for testing (the QA agent). Testing is many small steps (open, click, read what
+ * changed), so it runs on the cheapest allowed model that can use tools, preferring the default's
+ * provider. FORGE_QA_MODEL ("provider:model", or "default") overrides this. null: the default.
+ */
+export async function qaModelKey(): Promise<string | null> {
+  const { sorted, def } = await buildModels();
+  if (!def) return null;
+  const forced = process.env.FORGE_QA_MODEL?.trim();
+  if (forced === "default") return null;
+  if (forced && sorted.some((m) => modelKey(m.provider, m.id) === forced)) return forced;
+  const cheaper = sorted.filter((m) => m.cost < def.cost);
+  const pick = cheaper.find((m) => m.provider === def.provider) ?? cheaper[0];
+  return pick ? modelKey(pick.provider, pick.id) : null;
 }
 
 /** The prompt box's model picker for a project. */
@@ -135,8 +219,10 @@ export async function projectModels(lastModel: string | null): Promise<ProjectMo
     available: Boolean(s.secret[m.provider] ?? envKey(m.provider)),
     canCode: modelCanCode(m.provider, m.id),
   }));
-  const current = models.find((m) => m.key === lastModel && m.available)?.key ?? defaultKey;
-  return { models, defaultKey, currentKey: current };
+  // Auto is offered when there is something to choose between.
+  const auto = new Set(models.filter((m) => m.available && m.canCode).map((m) => m.cost)).size > 1;
+  const current = lastModel === AUTO_MODEL && auto ? AUTO_MODEL : (models.find((m) => m.key === lastModel && m.available)?.key ?? defaultKey);
+  return { models, defaultKey, currentKey: current, auto };
 }
 
 /** Whether any run can start (a key for the chosen AI exists). */

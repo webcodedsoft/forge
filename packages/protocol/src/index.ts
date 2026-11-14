@@ -287,6 +287,8 @@ export const RunEvent = z.discriminatedUnion("type", [
     pricedBy: z.literal("forge").optional(),
     /** Cumulative cost of the agent session (the SDK's total_cost_usd), used to derive per-run cost. */
     sessionCostUsd: z.number().optional(),
+    /** Tokens the conversation held at the end of this turn (what every further step would resend). */
+    contextTokens: z.number().optional(),
   }),
   z.object({
     ...base,
@@ -328,6 +330,17 @@ export const StartRunInput = z.object({
   model: z.string().max(160).optional(),
 });
 export type StartRunInput = z.infer<typeof StartRunInput>;
+
+/** Starting a test: what to focus on, what to leave alone, and how thorough to be. */
+export const StartQaInput = z.object({
+  /** What to test, in the person's words. Empty: the latest change (quick) or the whole app (full). */
+  only: z.string().trim().max(2000).optional(),
+  /** What not to test. */
+  skip: z.string().trim().max(2000).optional(),
+  /** quick: the essentials in about a minute. full: every feature plus edge cases. */
+  depth: z.enum(["quick", "full"]).default("quick"),
+});
+export type StartQaInput = z.infer<typeof StartQaInput>;
 
 /** A request waiting for the agent to finish its current run. */
 export type QueuedMessage = { id: string; prompt: string; mode: RunMode; model: string | null; userId: string; userName: string; createdAt: string };
@@ -623,8 +636,10 @@ export type ProjectModels = {
   models: (AllowedModel & { key: string; available: boolean; canCode: boolean })[];
   /** "provider:model" of the workspace default. */
   defaultKey: string;
-  /** "provider:model" the project used last (if still allowed), else the default. */
+  /** "provider:model" the project used last (if still allowed), else the default; "auto" when Auto is on. */
   currentKey: string;
+  /** Whether "Auto" can be offered (models of different cost levels are allowed). */
+  auto?: boolean;
 };
 
 export type UpdateAiSettingsInput = {
@@ -963,6 +978,8 @@ export type ProjectComment = {
   guest?: boolean;
   /** Guest feedback: the share link's label, when it has one. */
   via?: string | null;
+  /** On a shared preview: the thread's number in the team's Comments, so both sides say "comment 3". */
+  n?: number;
   body: string;
   /** Thread roots only. */
   anchor: CommentAnchor | null;

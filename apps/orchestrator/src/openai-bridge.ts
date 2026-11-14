@@ -1,5 +1,5 @@
 import type { ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { env } from "./env.ts";
 
 /*
@@ -11,6 +11,15 @@ import { env } from "./env.ts";
  *      (message_start, content blocks with text and tool-use deltas, message_delta, message_stop).
  * Claude-only features (thinking blocks, prompt caching, server tools such as web search) are
  * dropped on the way out. Errors come back in Anthropic's error shape so the agent retries the same way.
+ *
+ * Keeping costs down and answers good:
+ *   - prompt_cache_key (the project) keeps a project's requests on the same cache, so the long
+ *     shared prefix of an agent conversation is billed at the cached rate.
+ *   - Reasoning models think before each step. OpenAI returns that thinking as encrypted
+ *     "reasoning" items; the agent's Anthropic-format history can't hold them, so this file keeps
+ *     them (in memory, per step) and puts them back on the next request. Without them the model
+ *     starts its thinking over at every tool step.
+ *   - Effort: small side tasks (titles, command checks) think little; building uses the default.
  */
 
 /* ------------------------------ Anthropic types ----------------------------- */
@@ -90,11 +99,48 @@ function parameters(schema: Record<string, unknown> | undefined): Record<string,
   return rest.type ? rest : { type: "object", ...rest };
 }
 
+export type BridgeOptions = {
+  /** Keeps one project's requests on the same prompt cache. */
+  cacheKey?: string;
+  /** A small side task of the agent (a title, a command check), not a building step. */
+  sideTask?: boolean;
+};
+
+const EFFORTS = ["minimal", "low", "medium", "high"];
+/** The effort for building steps (FORGE_OPENAI_EFFORT: low, medium or high). */
+const MAIN_EFFORT = EFFORTS.includes(process.env.FORGE_OPENAI_EFFORT ?? "") ? process.env.FORGE_OPENAI_EFFORT! : "medium";
+
 /**
- * How hard a reasoning model thinks. The agent asks for extended thinking on most turns; "high"
- * is slow and costly, so it's kept for large thinking budgets and "medium" is the default.
+ * How hard a reasoning model thinks. Side tasks need little; the agent asks for extended thinking
+ * on most building steps, where "high" is slow and costly, so it's kept for large thinking budgets.
  */
-const effortFor = (req: AnthropicRequest) => ((req.thinking?.budget_tokens ?? 0) >= 24_000 ? "high" : "medium");
+const effortFor = (req: AnthropicRequest, opts: BridgeOptions = {}) =>
+  opts.sideTask ? "low" : (req.thinking?.budget_tokens ?? 0) >= 24_000 ? "high" : MAIN_EFFORT;
+
+/* ----------------------------- kept reasoning ----------------------------- */
+/*
+ * Reasoning items of earlier steps, by what they led to: a tool call's id, or the text of a
+ * message. In memory only: after a restart the model simply thinks again.
+ */
+const MAX_KEPT = 1500;
+const kept = new Map<string, Record<string, unknown>[]>();
+const textKey = (text: string) => `text:${createHash("sha256").update(text).digest("base64url").slice(0, 24)}`;
+
+function keepReasoning(output: ROutput[] | undefined) {
+  let pending: Record<string, unknown>[] = [];
+  for (const o of output ?? []) {
+    if (o.type === "reasoning") {
+      if (typeof o.encrypted_content === "string") pending.push({ type: "reasoning", id: o.id, summary: o.summary ?? [], encrypted_content: o.encrypted_content });
+      continue;
+    }
+    if (!pending.length) continue;
+    const key = o.type === "function_call" && o.call_id ? o.call_id : o.type === "message" ? textKey((o.content ?? []).map((c) => c.text ?? c.refusal ?? "").join("")) : null;
+    if (!key) continue;
+    kept.set(key, pending);
+    pending = [];
+    if (kept.size > MAX_KEPT) kept.delete(kept.keys().next().value!);
+  }
+}
 
 /** Reasoning models (o-series, GPT-5 family) take reasoning_effort and no temperature. */
 /**
@@ -103,7 +149,13 @@ const effortFor = (req: AnthropicRequest) => ((req.thinking?.budget_tokens ?? 0)
  */
 export const isReasoning = (model: string) => /^(o\d|gpt-([5-9]|\d{2}))/.test(model);
 
-export function toOpenAI(req: AnthropicRequest, model: string): Record<string, unknown> {
+/**
+ * The test agent drives one browser page: actions asked for at the same time would act on
+ * whichever page loaded last. Such requests get one tool call per answer.
+ */
+const oneBrowser = (req: AnthropicRequest) => (req.tools ?? []).some((t) => t.name.startsWith("mcp__browser__"));
+
+export function toOpenAI(req: AnthropicRequest, model: string, opts: BridgeOptions = {}): Record<string, unknown> {
   const messages: OMessage[] = [];
   const system = typeof req.system === "string" ? req.system : (req.system ?? []).map((b) => b.text).join("\n\n");
   if (system) messages.push({ role: "system", content: system });
@@ -135,13 +187,15 @@ export function toOpenAI(req: AnthropicRequest, model: string): Record<string, u
     .map((t) => ({ type: "function", function: { name: t.name, description: t.description ?? "", parameters: parameters(t.input_schema) } }));
 
   const body: Record<string, unknown> = { model, messages };
+  if (opts.cacheKey) body.prompt_cache_key = opts.cacheKey;
   if (tools.length) {
     body.tools = tools;
+    if (oneBrowser(req)) body.parallel_tool_calls = false;
     const tc = req.tool_choice;
     if (tc) body.tool_choice = tc.type === "any" ? "required" : tc.type === "tool" ? { type: "function", function: { name: tc.name } } : tc.type;
   }
   if (req.max_tokens) body.max_completion_tokens = req.max_tokens;
-  if (isReasoning(model)) body.reasoning_effort = effortFor(req);
+  if (isReasoning(model)) body.reasoning_effort = effortFor(req, opts);
   if (req.stream) {
     body.stream = true;
     body.stream_options = { include_usage: true };
@@ -329,16 +383,20 @@ function inputParts(list: Block[]): RItem[] {
   );
 }
 
-/** An Anthropic request as an OpenAI Responses request (reasoning models with tools). */
-export function toResponses(req: AnthropicRequest, model: string): Record<string, unknown> {
+/**
+ * An Anthropic request as an OpenAI Responses request (reasoning models with tools).
+ * `withReasoning`: put back the reasoning items kept from earlier steps.
+ */
+export function toResponses(req: AnthropicRequest, model: string, opts: BridgeOptions = {}, withReasoning = true): Record<string, unknown> {
   const input: RItem[] = [];
+  const reasoningFor = (key: string) => (withReasoning ? (kept.get(key) ?? []) : []);
   for (const m of req.messages) {
     const list = blocks(m.content);
     if (m.role === "assistant") {
       const text = list.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
-      if (text) input.push({ role: "assistant", content: [{ type: "output_text", text }] });
+      if (text) input.push(...reasoningFor(textKey(text)), { role: "assistant", content: [{ type: "output_text", text }] });
       for (const b of list) {
-        if (b.type === "tool_use") input.push({ type: "function_call", call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {}) });
+        if (b.type === "tool_use") input.push(...reasoningFor(b.id), { type: "function_call", call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {}) });
       }
       continue;
     }
@@ -356,22 +414,35 @@ export function toResponses(req: AnthropicRequest, model: string): Record<string
   const tools = (req.tools ?? [])
     .filter((t) => t.input_schema && (!t.type || t.type === "custom"))
     .map((t) => ({ type: "function", name: t.name, description: t.description ?? "", parameters: parameters(t.input_schema), strict: false }));
-  const body: Record<string, unknown> = { model, input, store: false };
+  // Stateless (store: false): reasoning items come back encrypted, for keepReasoning().
+  const body: Record<string, unknown> = { model, input, store: false, include: ["reasoning.encrypted_content"] };
+  if (opts.cacheKey) body.prompt_cache_key = opts.cacheKey;
   if (system) body.instructions = system;
   if (tools.length) {
     body.tools = tools;
+    if (oneBrowser(req)) body.parallel_tool_calls = false;
     const tc = req.tool_choice;
     if (tc) body.tool_choice = tc.type === "any" ? "required" : tc.type === "tool" ? { type: "function", name: tc.name } : tc.type;
   }
   if (req.max_tokens) body.max_output_tokens = req.max_tokens;
-  body.reasoning = { effort: effortFor(req) };
+  body.reasoning = { effort: effortFor(req, opts) };
   if (req.stream) body.stream = true;
   return body;
 }
 
 type RUsage = { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number } };
 const rUsage = (u: RUsage | undefined) => usage(u && { prompt_tokens: u.input_tokens, completion_tokens: u.output_tokens, prompt_tokens_details: u.input_tokens_details });
-type ROutput = { type: string; call_id?: string; name?: string; arguments?: string; content?: { type: string; text?: string; refusal?: string }[] };
+type ROutput = {
+  type: string;
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+  content?: { type: string; text?: string; refusal?: string }[];
+  /** Reasoning items. */
+  summary?: unknown[];
+  encrypted_content?: string;
+};
 type RResponse = { status?: string; output?: ROutput[]; usage?: RUsage; incomplete_details?: { reason?: string } | null; error?: { message?: string } | null };
 
 const rStop = (r: RResponse, sawTool: boolean) =>
@@ -473,6 +544,7 @@ async function streamResponsesBack(upstream: Response, res: ServerResponse, mode
     }
   }
   close();
+  keepReasoning(final.output);
   const u = rUsage(final.usage);
   send("message_delta", {
     type: "message_delta",
@@ -485,10 +557,10 @@ async function streamResponsesBack(upstream: Response, res: ServerResponse, mode
 }
 
 /** Answers one request; returns the tokens it used (null when it failed). */
-export async function bridgeMessages(req: AnthropicRequest, res: ServerResponse, apiKey: string, model: string): Promise<BridgeUsage | null> {
+export async function bridgeMessages(req: AnthropicRequest, res: ServerResponse, apiKey: string, model: string, opts: BridgeOptions = {}): Promise<BridgeUsage | null> {
   // Reasoning models can only use tools through the Responses API; others use Chat Completions.
   const responses = isReasoning(model);
-  const body = responses ? toResponses(req, model) : toOpenAI(req, model);
+  let body = responses ? toResponses(req, model, opts) : toOpenAI(req, model, opts);
   const limitKey = responses ? "max_output_tokens" : "max_completion_tokens";
   const call = () =>
     fetch(`${env.OPENAI_BASE_URL}/${responses ? "responses" : "chat/completions"}`, {
@@ -505,6 +577,19 @@ export async function bridgeMessages(req: AnthropicRequest, res: ServerResponse,
       const text = await upstream.clone().text();
       if (/max_(completion_|output_)?tokens/.test(text)) {
         delete body[limitKey];
+        upstream = await call();
+      }
+    }
+    // Extras that only save cost must never fail a request: retry once without them.
+    if (upstream.status === 400) {
+      const text = await upstream.clone().text();
+      if (/prompt_cache_key|reasoning|encrypted_content|include|parallel_tool_calls/i.test(text)) {
+        console.warn(`OpenAI rejected an optional field (${model}); retrying without: ${text.slice(0, 200)}`);
+        const hadLimit = limitKey in body;
+        body = responses ? toResponses(req, model, { sideTask: opts.sideTask }, false) : toOpenAI(req, model, { sideTask: opts.sideTask });
+        if (responses) delete body.include;
+        delete body.parallel_tool_calls;
+        if (!hadLimit) delete body[limitKey];
         upstream = await call();
       }
     }
@@ -525,6 +610,7 @@ export async function bridgeMessages(req: AnthropicRequest, res: ServerResponse,
   }
   if (req.stream) return responses ? streamResponsesBack(upstream, res, model) : streamBack(upstream, res, model);
   const answer = await upstream.json();
+  if (responses) keepReasoning((answer as RResponse).output);
   const out = responses ? fromResponses(answer as RResponse, model) : fromOpenAI(answer as Parameters<typeof fromOpenAI>[0], model);
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(out));

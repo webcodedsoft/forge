@@ -34,6 +34,18 @@ const Env = z.object({
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com/v1"),
   /** Model the build agent uses. */
   FORGE_MODEL: z.string().default("claude-opus-5-5"),
+  /**
+   * AI cost controls (runs.ts).
+   * FORGE_RUN_BUDGET_USD: the most one request may spend before it is stopped (0: no limit).
+   * A project's conversation with the agent starts fresh (carrying a summary) when it has been
+   * idle for FORGE_SESSION_IDLE_MIN minutes and holds more than FORGE_SESSION_IDLE_TOKENS tokens
+   * (the provider's cache has expired, so resuming would pay for all of it again), or as soon as
+   * it holds more than FORGE_SESSION_MAX_TOKENS.
+   */
+  FORGE_RUN_BUDGET_USD: z.coerce.number().min(0).default(5),
+  FORGE_SESSION_IDLE_MIN: z.coerce.number().min(0).default(5),
+  FORGE_SESSION_IDLE_TOKENS: z.coerce.number().int().min(0).default(40_000),
+  FORGE_SESSION_MAX_TOKENS: z.coerce.number().int().min(0).default(90_000),
   /** Comma-separated email domains allowed to sign up. Empty = anyone who can reach the app. */
   ALLOWED_EMAIL_DOMAINS: z.string().optional(),
   /** Figma access token, if not set in Settings › Integrations (that one wins). */

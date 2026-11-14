@@ -1,14 +1,14 @@
 // Forge agent runner. Runs inside a project sandbox container.
 //
 // Input (env FORGE_INPUT_B64: base64 of one JSON object):
-//   { prompt: string, sessionId?: string, model: string, appendSystemPrompt?: string }
+//   { prompt: string, sessionId?: string, model: string, appendSystemPrompt?: string, maxBudgetUsd?: number }
 // Output (stdout, JSON Lines). Every line has `kind` and `at`:
 //   session     { sessionId }
 //   delta       { text }                       streamed assistant text
 //   assistant   { text }                       complete assistant text block
 //   tool_call   { toolUseId, tool, input }
 //   tool_result { toolUseId, ok, output }
-//   usage       { inputTokens, outputTokens, cacheReadTokens, costUsd }
+//   usage       { inputTokens, outputTokens, cacheReadTokens, costUsd, contextTokens }
 //   pause       { pauseId, pauseKind: question|plan, payload }   waiting for the user
 //   spec_update { update }                     changes to the living spec (applied when the version is saved)
 //   done        { status: completed|failed|cancelled, result?, error? }
@@ -304,6 +304,34 @@ async function getPage() {
   return page;
 }
 
+/**
+ * Wait until the page has stopped changing after an action (no DOM change for 150 ms), at most
+ * `max` ms. Usually returns in a fraction of the fixed pause it replaces.
+ */
+async function settle(p, max = 800) {
+  await p
+    .evaluate(
+      (limit) =>
+        new Promise((resolve) => {
+          let quiet;
+          const finish = () => {
+            obs.disconnect();
+            clearTimeout(hard);
+            resolve();
+          };
+          const obs = new MutationObserver(() => {
+            clearTimeout(quiet);
+            quiet = setTimeout(finish, 150);
+          });
+          obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+          quiet = setTimeout(finish, 150);
+          const hard = setTimeout(finish, limit);
+        }),
+      max,
+    )
+    .catch(() => p.waitForTimeout(250)); // the page navigated while waiting
+}
+
 /* Live view: stream the QA browser to the builder (~6 fps JPEG, not stored). */
 async function startScreencast(p) {
   const cdp = await p.context().newCDPSession(p);
@@ -324,22 +352,28 @@ const CURSOR_SCRIPT = `(() => {
   const install = () => {
     const c = document.createElement("div");
     c.setAttribute("aria-hidden", "true");
-    c.style.cssText = "position:fixed;left:0;top:0;width:24px;height:24px;z-index:2147483647;pointer-events:none;transition:transform .45s cubic-bezier(.2,.8,.2,1);transform:translate(640px,400px)";
-    c.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24"><path d="M4 2l7.5 19 2.6-7.8L22 10.6z" fill="#111" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>';
+    // Made to stand out on any page: a large magenta arrow with a white edge, a dark shadow (so it
+    // shows on light and on dark backgrounds) and a soft pulsing halo around its tip.
+    c.style.cssText = "position:fixed;left:0;top:0;width:32px;height:32px;z-index:2147483647;pointer-events:none;transition:transform .45s cubic-bezier(.2,.8,.2,1);transform:translate(640px,400px)";
+    c.innerHTML =
+      '<span style="position:absolute;left:-13px;top:-13px;width:34px;height:34px;border-radius:50%;background:rgba(255,45,146,.28);box-shadow:0 0 0 2px rgba(255,45,146,.55);animation:__forgeHalo 1.4s ease-in-out infinite"></span>' +
+      '<svg width="32" height="32" viewBox="0 0 24 24" style="position:absolute;left:0;top:0;filter:drop-shadow(0 2px 3px rgba(0,0,0,.55))"><path d="M4 2l7.5 19 2.6-7.8L22 10.6z" fill="#ff2d92" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>';
     const s = document.createElement("style");
-    s.textContent = "@keyframes __forgeRipple{from{transform:scale(.4);opacity:1}to{transform:scale(1.8);opacity:0}}";
+    s.textContent =
+      "@keyframes __forgeRipple{from{transform:scale(.4);opacity:1}to{transform:scale(1.8);opacity:0}}" +
+      "@keyframes __forgeHalo{0%,100%{transform:scale(.75);opacity:.9}50%{transform:scale(1.15);opacity:.45}}";
     // What the agent is doing, next to the cursor (it fades out a moment after the step).
     const tag = document.createElement("div");
     tag.setAttribute("aria-hidden", "true");
-    tag.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;max-width:320px;padding:4px 9px;border-radius:7px;background:rgba(17,19,24,.92);color:#fff;font:600 12px/1.35 system-ui,-apple-system,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0;transition:transform .45s cubic-bezier(.2,.8,.2,1),opacity .25s";
+    tag.style.cssText = "position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;max-width:320px;padding:4px 9px;border-radius:7px;background:#ff2d92;color:#fff;font:600 12px/1.35 system-ui,-apple-system,sans-serif;box-shadow:0 0 0 1.5px #fff,0 3px 10px rgba(0,0,0,.4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0;transition:transform .45s cubic-bezier(.2,.8,.2,1),opacity .25s";
     document.documentElement.append(s, c, tag);
     let pos = [640, 400];
     let hideTimer = 0;
     const place = () => {
       // Right of and below the cursor; flipped left/up near the window's edges.
       const w = tag.offsetWidth || 160, h = tag.offsetHeight || 24;
-      const x = pos[0] + 22 + w > innerWidth - 8 ? pos[0] - w - 10 : pos[0] + 22;
-      const y = pos[1] + 26 + h > innerHeight - 8 ? pos[1] - h - 8 : pos[1] + 26;
+      const x = pos[0] + 28 + w > innerWidth - 8 ? pos[0] - w - 10 : pos[0] + 28;
+      const y = pos[1] + 34 + h > innerHeight - 8 ? pos[1] - h - 8 : pos[1] + 34;
       tag.style.transform = "translate(" + Math.max(8, x) + "px," + Math.max(8, y) + "px)";
     };
     window.__forgeCursor = {
@@ -353,7 +387,7 @@ const CURSOR_SCRIPT = `(() => {
       click(x, y) {
         const r = document.createElement("div");
         r.setAttribute("aria-hidden", "true");
-        r.style.cssText = "position:fixed;left:" + (x - 16) + "px;top:" + (y - 16) + "px;width:32px;height:32px;border-radius:50%;border:3px solid #f97316;z-index:2147483646;pointer-events:none;animation:__forgeRipple .6s ease-out forwards";
+        r.style.cssText = "position:fixed;left:" + (x - 16) + "px;top:" + (y - 16) + "px;width:32px;height:32px;border-radius:50%;border:3px solid #ff2d92;box-shadow:0 0 0 1.5px #fff;z-index:2147483646;pointer-events:none;animation:__forgeRipple .6s ease-out forwards";
         document.documentElement.append(r);
         setTimeout(() => r.remove(), 700);
       },
@@ -373,14 +407,15 @@ const nameOf = (t) => (t.name || t.label || t.text || (t.role ? `the ${t.role}` 
 async function pointAt(loc, click, label) {
   const p = await getPage();
   if (label) await showLabel(label, 3200);
-  await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined);
-  const box = await loc.boundingBox().catch(() => null);
+  // Short limits: the element was just found (see find), so these only cover a page that is still moving.
+  await loc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
+  const box = await loc.boundingBox({ timeout: 1000 }).catch(() => null);
   if (!box) return;
   cursor.x = Math.round(box.x + box.width / 2);
   cursor.y = Math.round(box.y + box.height / 2);
   await p.evaluate(([x, y]) => window.__forgeCursor?.move(x, y), [cursor.x, cursor.y]).catch(() => undefined);
-  await p.mouse.move(cursor.x, cursor.y, { steps: 12 });
-  await p.waitForTimeout(450);
+  await p.mouse.move(cursor.x, cursor.y, { steps: 6 });
+  await p.waitForTimeout(220);
   if (click) await p.evaluate(([x, y]) => window.__forgeCursor?.click(x, y), [cursor.x, cursor.y]).catch(() => undefined);
 }
 
@@ -393,14 +428,107 @@ async function locate(t) {
   throw new Error("Give role (+ name), label, text or selector.");
 }
 
-async function snapshot(note) {
+// The page as last shown to the agent. After a click or a key press usually little changes, so
+// the agent gets only what changed (every result stays in its context for the rest of the run).
+let lastSeen = { url: "", lines: [] };
+const MAX_TREE = 9000;
+
+/** Lines added and removed between two accessibility trees, or null when most of the page changed. */
+function treeChanges(before, after) {
+  const count = (lines) => {
+    const m = new Map();
+    for (const l of lines) m.set(l, (m.get(l) ?? 0) + 1);
+    return m;
+  };
+  const a = count(before), b = count(after);
+  const added = [], removed = [];
+  for (const l of after) {
+    if ((a.get(l) ?? 0) > 0) a.set(l, a.get(l) - 1);
+    else added.push(l);
+  }
+  for (const l of before) {
+    if ((b.get(l) ?? 0) > 0) b.set(l, b.get(l) - 1);
+    else removed.push(l);
+  }
+  if (added.length + removed.length > Math.max(12, after.length * 0.5)) return null;
+  return { added, removed };
+}
+
+/** `full`: always the whole page (opening a page, or the agent asked to look). */
+/**
+ * The element a step names, once it is on the page. A name that matches nothing fails within
+ * 1.5 s (not after the 30 to 40 s of waiting it used to take) and says what could be meant instead.
+ */
+async function find(t) {
+  const p = await getPage();
+  const visible = (loc, ms) => loc.waitFor({ state: "visible", timeout: ms }).then(() => true, () => false);
+  const primary = await locate(t);
+  if (await visible(primary, 1200)) return primary;
+  // The name is often right and the role or kind of lookup wrong (a "searchbox" that is a plain
+  // text field, a label that is really a placeholder). Try the other ways of finding that name.
+  const name = (t.name || t.label || t.text || "").trim();
+  if (name && !t.selector) {
+    const others = [
+      p.getByLabel(name),
+      p.getByPlaceholder(name),
+      ...["textbox", "searchbox", "combobox", "button", "link", "tab", "checkbox", "menuitem"].filter((r) => r !== t.role).map((r) => p.getByRole(r, { name })),
+      p.getByTitle(name),
+      p.getByText(name),
+    ];
+    for (const o of others) if (await visible(o.first(), 150)) return o.first();
+  }
+  const aria = await p.locator("body").ariaSnapshot({ timeout: 3000 }).catch(() => "");
+  const kinds = /^\s*-\s*(button|link|tab|checkbox|radio|switch|textbox|searchbox|combobox|slider|spinbutton|menuitem|option)\b\s*("[^"]*")?/;
+  const names = [...new Set(aria.split("\n").flatMap((l) => { const m = kinds.exec(l); return m && m[2] ? [`${m[1]} ${m[2]}`] : []; }))].slice(0, 40);
+  throw new Error(
+    `Nothing on the page (${new URL(p.url()).pathname}) matches ${nameOf(t)}${t.role ? ` (role ${t.role})` : ""}. Use an exact name from the page` +
+      (names.length ? `. Things you can use here: ${names.join(", ")}` : "; call snapshot to see it."),
+  );
+}
+
+/** Replace a field's content, typing it out so people watching see it appear (short pauses; long text is pasted). */
+async function typeVisibly(loc, value) {
+  await loc.fill("", { timeout: 3000 });
+  if (value.length <= 60) await loc.pressSequentially(value, { delay: 25, timeout: 6000 });
+  else await loc.fill(value, { timeout: 3000 });
+}
+
+/** A control that is switched off can't be used: say so at once instead of waiting for it. */
+async function mustBeEnabled(loc, t, verb) {
+  if (await loc.isDisabled({ timeout: 500 }).catch(() => false)) {
+    const why = await loc.getAttribute("title", { timeout: 500 }).catch(() => null);
+    throw new Error(`“${nameOf(t)}” is disabled, so it can't be ${verb}${why ? ` (its tooltip says: ${why})` : ""}. That may be intended or a problem: judge from what you were asked to test.`);
+  }
+}
+
+// One browser, one page: actions run one after another, in the order they were asked for, even
+// when the model asks for several at once (which would otherwise race on the same page).
+let browserQueue = Promise.resolve();
+const inTurn = (handler) => (...args) => {
+  const run = browserQueue.then(() => handler(...args));
+  browserQueue = run.catch(() => undefined);
+  return run;
+};
+const SCREENS = { phone: { width: 390, height: 844 }, tablet: { width: 820, height: 1180 }, desktop: { width: 1280, height: 800 } };
+
+async function snapshot(note, full = false) {
   const p = await getPage();
   const aria = await p.locator("body").ariaSnapshot({ timeout: 5000 }).catch((e) => `(snapshot failed: ${e.message})`);
   const errs = consoleErrors.splice(0);
-  return text(
-    `${note ? note + "\n" : ""}URL: ${p.url()}\nTitle: ${await p.title()}\n\nPage (accessibility tree):\n${aria.slice(0, 12000)}` +
-      (errs.length ? `\n\nNew console errors:\n- ${errs.join("\n- ")}` : ""),
-  );
+  const url = p.url();
+  const lines = aria.split("\n");
+  const changes = !full && url === lastSeen.url && lastSeen.lines.length ? treeChanges(lastSeen.lines, lines) : null;
+  lastSeen = { url, lines };
+  let body;
+  if (changes && !changes.added.length && !changes.removed.length) body = "The page did not change.";
+  else if (changes) {
+    const cut = (list) => list.slice(0, 60).join("\n") + (list.length > 60 ? `\n… (${list.length - 60} more lines)` : "");
+    body =
+      "What changed on the page (the rest is as you last saw it; call snapshot for the whole page):" +
+      (changes.added.length ? `\nNow shown:\n${cut(changes.added)}` : "") +
+      (changes.removed.length ? `\nNo longer shown:\n${cut(changes.removed)}` : "");
+  } else body = `Page (accessibility tree):\n${aria.slice(0, MAX_TREE)}${aria.length > MAX_TREE ? "\n… (cut off; the page is longer)" : ""}`;
+  return text(`${note ? note + "\n" : ""}URL: ${url}\nTitle: ${await p.title()}\n\n${body}` + (errs.length ? `\n\nNew console errors:\n- ${errs.join("\n- ")}` : ""));
 }
 
 const target = {
@@ -411,43 +539,120 @@ const target = {
   selector: z.string().optional().describe("CSS selector (last resort)"),
 };
 
+/** A browser tool: its calls run one at a time (see inTurn). */
+const bt = (name, description, schema, handler) => tool(name, description, schema, inTurn(handler));
+
 const qaTools = createSdkMcpServer({
   name: "browser",
   version: "1.0.0",
   alwaysLoad: true,
   tools: [
-    tool("open", "Open a path of the running app (e.g. / or /about) and return the page's accessibility tree.", { path: z.string() }, async ({ path }) => {
+    bt("open", "Open a path of the running app (e.g. / or /about) and return the page's accessibility tree.", { path: z.string() }, async ({ path }) => {
       const p = await getPage();
       const res = await p.goto(APP_URL + (path.startsWith("/") ? path : `/${path}`), { waitUntil: "load", timeout: 120_000 });
       await showLabel(`Opened ${path.startsWith("/") ? path : `/${path}`}`, 2200);
-      await p.waitForTimeout(1200);
-      return snapshot(`HTTP ${res?.status() ?? "?"}`);
+      await settle(p, 1200);
+      return snapshot(`HTTP ${res?.status() ?? "?"}`, true);
     }),
-    tool("snapshot", "Return the current page's accessibility tree and any new console errors.", {}, async () => snapshot()),
-    tool("click", "Click an element, then return the updated page.", target, async (t) => {
-      const loc = await locate(t);
+    bt("snapshot", "Return the whole current page (accessibility tree) and any new console errors. click, fill and press already tell you what changed.", {}, async () => snapshot(undefined, true)),
+    bt("click", "Click an element, then return what changed on the page.", target, async (t) => {
+      const loc = await find(t);
+      await mustBeEnabled(loc, t, "clicked");
       await pointAt(loc, true, `Clicking “${nameOf(t)}”`);
-      await loc.click({ timeout: 5000 });
-      await (await getPage()).waitForTimeout(800);
+      await loc.click({ timeout: 3000 });
+      await settle(await getPage());
       return snapshot();
     }),
-    tool("fill", "Type into a field (replacing its content), then return the updated page.", { ...target, value: z.string() }, async (t) => {
-      const loc = await locate(t);
+    bt("fill", "Type into a field (replacing its content), then return what changed on the page.", { ...target, value: z.string() }, async (t) => {
+      const loc = await find(t);
+      await mustBeEnabled(loc, t, "typed into");
       await pointAt(loc, true, `Typing “${String(t.value).slice(0, 30)}”`);
-      await loc.fill(t.value, { timeout: 5000 });
+      await typeVisibly(loc, t.value);
       return snapshot();
     }),
-    tool("press", "Press a key (e.g. Enter, Escape, Tab) on the focused element.", { key: z.string() }, async ({ key }) => {
+    bt("press", "Press a key (e.g. Enter, Escape, Tab) on the focused element.", { key: z.string() }, async ({ key }) => {
       await showLabel(`Pressing ${key}`, 2000);
       await (await getPage()).keyboard.press(key);
-      await (await getPage()).waitForTimeout(600);
+      await settle(await getPage());
       return snapshot();
     }),
-    tool("screenshot", "Take a screenshot of the current viewport to check layout and visuals.", {}, async () => {
-      const buf = await (await getPage()).screenshot({ type: "png" });
-      return { content: [{ type: "image", data: buf.toString("base64"), mimeType: "image/png" }] };
+    bt(
+      "steps",
+      "Do several actions in a row and get back what changed on the page at the end. Much faster than one call per action: " +
+        "use it whenever you know the next few actions (fill a form and submit it, click through tabs, add three items). " +
+        "It stops at the first action that fails and tells you which one. Up to 10 actions.",
+      {
+        steps: z
+          .array(
+            z.object({
+              action: z.enum(["open", "click", "fill", "press"]),
+              path: z.string().optional().describe("open: the app path"),
+              target: z.object(target).optional().describe("click, fill: the element"),
+              value: z.string().optional().describe("fill: the text to type"),
+              key: z.string().optional().describe("press: the key"),
+            }),
+          )
+          .min(1)
+          .max(10),
+      },
+      async ({ steps }) => {
+        const p = await getPage();
+        const done = [];
+        let failed = "";
+        for (const [i, s] of steps.entries()) {
+          try {
+            if (s.action === "open") {
+              const path = (s.path ?? "/").startsWith("/") ? (s.path ?? "/") : `/${s.path}`;
+              const res = await p.goto(APP_URL + path, { waitUntil: "load", timeout: 120_000 });
+              await showLabel(`Opened ${path}`, 1800);
+              await settle(p, 1000);
+              done.push(`${i + 1}. Opened ${path} (HTTP ${res?.status() ?? "?"})`);
+            } else if (s.action === "click") {
+              const loc = await find(s.target ?? {});
+              await mustBeEnabled(loc, s.target ?? {}, "clicked");
+              await pointAt(loc, true, `Clicking “${nameOf(s.target ?? {})}”`);
+              await loc.click({ timeout: 3000 });
+              await settle(p);
+              done.push(`${i + 1}. Clicked “${nameOf(s.target ?? {})}”`);
+            } else if (s.action === "fill") {
+              const loc = await find(s.target ?? {});
+              await mustBeEnabled(loc, s.target ?? {}, "typed into");
+              await pointAt(loc, true, `Typing “${String(s.value ?? "").slice(0, 30)}”`);
+              await typeVisibly(loc, String(s.value ?? ""));
+              done.push(`${i + 1}. Typed “${String(s.value ?? "").slice(0, 40)}” into “${nameOf(s.target ?? {})}”`);
+            } else {
+              await showLabel(`Pressing ${s.key}`, 1500);
+              await p.keyboard.press(String(s.key ?? "Enter"));
+              await settle(p);
+              done.push(`${i + 1}. Pressed ${s.key}`);
+            }
+          } catch (e) {
+            failed = `${i + 1}. FAILED (${s.action}${s.target ? ` “${nameOf(s.target)}”` : ""}): ${String(e?.message ?? e).split("\n")[0].slice(0, 200)}. The remaining ${steps.length - i - 1} action(s) were not done.`;
+            break;
+          }
+        }
+        return snapshot([...done, failed].filter(Boolean).join("\n"));
+      },
+    ),
+    bt(
+      "screen",
+      "Change the browser's screen size to check how the app looks and works on a phone, a tablet or a desktop. Returns the page at that size; take a screenshot afterwards to judge the layout. Set it back to desktop when you're done.",
+      { size: z.enum(["phone", "tablet", "desktop"]) },
+      async ({ size }) => {
+        const p = await getPage();
+        await p.setViewportSize(SCREENS[size]);
+        await showLabel(`${size[0].toUpperCase()}${size.slice(1)} size (${SCREENS[size].width} px wide)`, 2500);
+        await settle(p, 1000);
+        const overflow = await p.evaluate(() => document.documentElement.scrollWidth - window.innerWidth).catch(() => 0);
+        return snapshot(`Screen: ${size}, ${SCREENS[size].width} x ${SCREENS[size].height}.${overflow > 4 ? ` The page is ${overflow} px wider than the screen (it scrolls sideways).` : " The page fits the width."}`, true);
+      },
+    ),
+    bt("screenshot", "Take a screenshot of the current viewport to check layout and visuals.", {}, async () => {
+      // JPEG: a fraction of a PNG's size, and plenty to judge layout.
+      const buf = await (await getPage()).screenshot({ type: "jpeg", quality: 70 });
+      return { content: [{ type: "image", data: buf.toString("base64"), mimeType: "image/jpeg" }] };
     }),
-    tool(
+    bt(
       "propose_test",
       [
         "Propose a repeatable test for a flow that works right now. Forge replays it after every new version, without you, and offers passing ones to the team to save.",
@@ -476,7 +681,7 @@ const qaTools = createSdkMcpServer({
         return text("Proposed. Forge will replay it once the test run ends.");
       },
     ),
-    tool(
+    bt(
       "report_issue",
       "Report one problem you found. Call it once per distinct issue.",
       {
@@ -496,6 +701,8 @@ const qaTools = createSdkMcpServer({
 });
 
 let finished = false;
+// How much the conversation holds now: what the latest model call read (new + cached) plus what it wrote.
+let contextTokens = 0;
 try {
   for await (const msg of query({
     prompt: input.prompt,
@@ -507,11 +714,15 @@ try {
       includePartialMessages: true,
       // The container is the security boundary: the agent may run any tool
       // inside it, and it has no access to the host.
+      // Stop a run that spends more than Forge allows for one request.
+      ...(input.maxBudgetUsd > 0 ? { maxBudgetUsd: input.maxBudgetUsd } : {}),
+      // Testing: a ceiling on model calls, so a test can't wander on.
+      ...(input.maxTurns > 0 ? { maxTurns: input.maxTurns } : {}),
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       mcpServers: QA ? { browser: qaTools } : { forge: forgeTools },
       allowedTools: QA
-        ? ["Read", "Glob", "Grep", "TodoWrite", ...["open", "snapshot", "click", "fill", "press", "screenshot", "report_issue", "propose_test"].map((n) => `mcp__browser__${n}`)]
+        ? ["Read", "Glob", "Grep", "TodoWrite", ...["open", "snapshot", "click", "fill", "press", "steps", "screen", "screenshot", "report_issue", "propose_test"].map((n) => `mcp__browser__${n}`)]
         : [
             "Read", "Write", "Edit", "Bash", "Glob", "Grep", "TodoWrite", "WebFetch", "WebSearch",
             "mcp__forge__ask_user", "mcp__forge__present_plan", "mcp__forge__save_to_library", "mcp__forge__look_at_page", "mcp__forge__update_spec",
@@ -526,7 +737,10 @@ try {
             : undefined,
       // Load the project's CLAUDE.md (which imports AGENTS.md).
       settingSources: ["project"],
-      systemPrompt: { type: "preset", preset: "claude_code", append: input.appendSystemPrompt ?? "" },
+      // excludeDynamicSections: the working directory and git status go into the first message
+      // instead, so the system prompt is the same for every project and conversation and the
+      // provider's prompt cache is shared between them.
+      systemPrompt: { type: "preset", preset: "claude_code", append: input.appendSystemPrompt ?? "", excludeDynamicSections: true },
     },
   })) {
     switch (msg.type) {
@@ -542,12 +756,18 @@ try {
         break;
       }
 
-      case "assistant":
+      case "assistant": {
+        // Sub-agents have their own context; only the main conversation counts.
+        const u = msg.message?.usage;
+        if (u && !msg.parent_tool_use_id) {
+          contextTokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.output_tokens ?? 0);
+        }
         for (const block of msg.message?.content ?? []) {
           if (block.type === "text" && block.text.trim()) emit({ kind: "assistant", text: block.text });
           else if (block.type === "tool_use") emit({ kind: "tool_call", toolUseId: block.id, tool: block.name, input: block.input });
         }
         break;
+      }
 
       case "user":
         if (Array.isArray(msg.message?.content)) {
@@ -567,12 +787,16 @@ try {
           outputTokens: u.output_tokens ?? 0,
           cacheReadTokens: u.cache_read_input_tokens ?? 0,
           costUsd: msg.total_cost_usd ?? 0,
+          contextTokens,
         });
         finished = true;
         emit(
           msg.subtype === "success"
             ? { kind: "done", status: "completed", result: msg.result }
-            : { kind: "done", status: "failed", error: `Agent stopped: ${msg.subtype}` },
+            : QA && msg.subtype === "error_max_turns"
+              ? // The test used all its steps: what it found so far still counts.
+                { kind: "done", status: "completed", result: "The test reached its step limit before finishing. The problems listed are what it found until then; run a full test, or tell it what to focus on, to cover more." }
+              : { kind: "done", status: "failed", error: `Agent stopped: ${msg.subtype}` },
         );
         break;
       }

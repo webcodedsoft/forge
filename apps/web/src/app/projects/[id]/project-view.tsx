@@ -82,6 +82,7 @@ import { useProjectEvents } from "@/lib/use-project-events";
 import { ApisPicker } from "./apis-picker";
 import { BrainPanel } from "./brain-panel";
 import { SpecPanel } from "./spec-panel";
+import { TestButton } from "./test-button";
 import { PauseCard } from "./pause-card";
 import { VersionsPanel } from "./versions-panel";
 
@@ -164,9 +165,14 @@ function toItems(events: RunEvent[]): Item[] {
       case "notice":
         items.push({ kind: "notice", e });
         break;
-      case "qa.report":
+      case "qa.report": {
+        // The test agent's closing message is the report's summary: show it once, in the report.
+        const same = (t: string) => t.replace(/\s+/g, " ").trim() === e.summary.replace(/\s+/g, " ").trim();
+        const at = items.findLastIndex((it) => it.kind === "text" && it.e.runId === e.runId);
+        if (at >= 0 && same((items[at] as Extract<Item, { kind: "text" }>).e.text)) items.splice(at, 1);
         items.push({ kind: "qa", e });
         break;
+      }
       case "branch":
         items.push({ kind: "branch", e });
         break;
@@ -328,7 +334,7 @@ export function ProjectView() {
         (m) => {
           if (!live) return;
           setModels(m);
-          setModelKey((k) => (k && m.models.some((x) => x.key === k && x.available) ? k : m.currentKey));
+          setModelKey((k) => (k && ((k === "auto" && m.auto) || m.models.some((x) => x.key === k && x.available)) ? k : m.currentKey));
         },
         () => undefined,
       );
@@ -342,7 +348,7 @@ export function ProjectView() {
   }, [id, runCount]);
   // A chat-only model can't build: outside Chat mode the picker and the request use the default.
   const effectiveModelKey = (() => {
-    if (!models || !modelKey) return modelKey;
+    if (!models || !modelKey || modelKey === "auto") return modelKey;
     const m = models.models.find((x) => x.key === modelKey);
     return m && !m.canCode && mode !== "chat" ? models.defaultKey : modelKey;
   })();
@@ -942,15 +948,15 @@ export function ProjectView() {
               <SecretsButton projectId={id} disabled={running} refreshKey={secretNotices} onError={showError} />
               <ApisPicker projectId={id} disabled={running} onError={showError} />
               {project && <AutoQaSwitch project={project} onChange={setProject} onError={showError} />}
-              <button
-                disabled={running}
-                title={running ? "Wait for the agent to finish" : "A QA agent clicks through the app and reports problems"}
-                onClick={() => api.startQa(id).catch((e) => setError(errText(e)))}
-                className="btn btn-sm"
-              >
-                <FlaskConical size={14} aria-hidden />
-                Test the app
-              </button>
+              <TestButton
+                projectId={id}
+                running={running}
+                onStarted={() => {
+                  setTab("chat");
+                  setPanelPrefs({ collapsed: false });
+                }}
+                onError={showError}
+              />
             </>
           )}
           {project?.myRole === "viewer" && <span className="pill">View only</span>}
@@ -1388,7 +1394,7 @@ export function ProjectView() {
                   { id: "brain", label: "Brain (project notes)", run: () => setTab("brain") },
                   { id: "health", label: "Health (problems, tests, security)", run: () => setTab("health") },
                   { id: "code", label: "Code", run: () => setView("code") },
-                  { id: "test", label: "Test the app", run: () => void api.startQa(id).catch((e) => setError(errText(e))) },
+                  { id: "test", label: "Quick test of the latest change", run: () => void api.startQa(id).catch((e) => setError(errText(e))) },
                   { id: "download", label: "Download code (.zip)", run: () => window.location.assign(api.downloadUrl(id, project?.name ?? id)) },
                 ]}
               />
@@ -2335,6 +2341,8 @@ const TOOL_LABELS: Record<string, string> = {
   mcp__browser__click: "Browser",
   mcp__browser__fill: "Browser",
   mcp__browser__press: "Browser",
+  mcp__browser__steps: "Browser",
+  mcp__browser__screen: "Browser",
   mcp__browser__snapshot: "Looked at the page",
   mcp__browser__screenshot: "Took a screenshot",
   mcp__browser__report_issue: "Reported a problem",

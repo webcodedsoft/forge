@@ -81,6 +81,11 @@ export const project = pgTable(
     status: projectStatus("status").default("created").notNull(),
     /** Claude Agent SDK session, resumed on each follow-up prompt. */
     agentSessionId: text("agent_session_id"),
+    /** When that session last finished a turn, and how many tokens it held then (runs.ts starts a fresh one when it's stale or large). */
+    agentSessionAt: timestamp("agent_session_at"),
+    agentContextTokens: integer("agent_context_tokens"),
+    /** Hash of each context section (brain, spec, library…) already sent in that session; only changed ones are sent again. */
+    agentContextSent: jsonb("agent_context_sent").$type<Record<string, string>>(),
     /** "template" (new app) or "github" (imported repo). */
     source: text("source").default("template").notNull(),
     /** owner/name for imported repos. */
